@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face Attendance</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="card" id="card">
+  <h1>Face Attendance</h1>
+  <p id="msg" class="msg" role="status"></p>
+
+  <section id="v-login" hidden>
+    <form id="f-login">
+      <input name="id" placeholder="Teacher ID" autocomplete="username" required>
+      <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+      <button class="primary">Log in</button>
+    </form>
+    <p class="alt">New teacher? <a href="#" data-go="register">Create account</a></p>
+  </section>
+
+  <section id="v-register" hidden>
+    <form id="f-register">
+      <input name="id" placeholder="Teacher ID (3-32 chars)" autocomplete="username" required>
+      <input name="password" type="password" placeholder="Password (8+ chars)" autocomplete="new-password" required>
+      <button class="primary">Create account</button>
+    </form>
+    <p class="alt">Have an account? <a href="#" data-go="login">Log in</a></p>
+  </section>
+
+  <section id="v-app" hidden>
+    <div class="topbar">
+      <div class="tabs" id="tabs">
+        <button data-tab="scan" class="active">Scan</button>
+        <button data-tab="session">Session</button>
+        <button data-tab="students">Students</button>
+      </div>
+      <button id="b-logout" class="link">Log out (<span id="who"></span>)</button>
+    </div>
+
+    <!-- ===== Scan (kiosk) ===== -->
+    <div class="pane" data-pane="scan">
+      <div id="scan-empty" class="empty" hidden>
+        <p>No active session. Start one to begin taking attendance.</p>
+        <button class="primary" data-open="session">Go to Session</button>
+      </div>
+      <div class="kiosk" id="scan-main">
+        <div class="scan big" id="scan-box">
+          <video id="kiosk-video" class="cam" playsinline muted></video>
+          <canvas id="dbg-canvas" class="cam" hidden></canvas>
+          <div class="guide" id="guide"></div>
+          <pre id="dbg-text" class="dbg" hidden></pre>
+          <div id="result" class="result" hidden>
+            <img id="result-img" alt="">
+            <div class="result-body"><div id="result-name"></div><div id="result-sub"></div></div>
+            <div class="result-actions"><button id="result-undo" class="warn">Wrong person</button><button id="result-pick">Pick student</button></div>
+          </div>
+          <div class="hint" id="kiosk-hint">Starting camera…</div>
+        </div>
+        <aside class="side">
+          <div class="session-line"><span id="k-class">—</span></div>
+          <div class="count"><strong id="k-present">0</strong> / <span id="k-total">0</span> present</div>
+          <div id="k-queue" class="queue" hidden></div>
+          <ol id="k-recent" class="recent"></ol>
+          <button id="b-manual">Mark manually…</button>
+          <button id="b-flip">Switch camera</button>
+          <button id="b-kiosk" class="primary">Pause</button>
+          <label class="check"><input type="checkbox" id="dbg-toggle"> Debug overlay</label>
+          <div id="dbg-panel" hidden>
+            <label>Match threshold: <strong id="dbg-thr-val"></strong>
+              <input type="range" id="dbg-thr" min="0.30" max="0.70" step="0.01"></label>
+            <label class="check"><input type="checkbox" id="dbg-live" checked> Require blink / head turn</label>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- ===== Session ===== -->
+    <div class="pane" data-pane="session" hidden>
+      <div id="sess-start">
+        <form id="f-session" class="row">
+          <input name="name" placeholder="Class name, e.g. Math 1A" maxlength="60" required>
+          <button class="primary">Start session</button>
+        </form>
+        <h3>Past sessions</h3>
+        <ul id="sess-history" class="roster"></ul>
+      </div>
+      <div id="sess-view" hidden>
+        <div class="row between">
+          <div><h3 id="sv-title"></h3><div id="sv-sub" class="alt left"></div></div>
+          <div class="row">
+            <button id="sv-csv">Export CSV</button>
+            <button id="sv-end" class="warn">End session</button>
+            <button id="sv-back">Back</button>
+          </div>
+        </div>
+        <table class="report"><thead><tr><th>Student</th><th>Status</th><th>Time</th><th></th></tr></thead><tbody id="sv-body"></tbody></table>
+      </div>
+    </div>
+
+    <!-- ===== Students ===== -->
+    <div class="pane" data-pane="students" hidden>
+      <div id="consent" class="consent">
+        <h3>Before you enrol faces</h3>
+        <ul>
+          <li><strong>What is stored:</strong> a numeric face template (not a photo) and one small thumbnail per student, encrypted at rest.</li>
+          <li><strong>Why:</strong> only to mark attendance in this app. It is not shared or used for anything else.</li>
+          <li><strong>Consent:</strong> students are minors. A guardian (or the school, per its policy) must consent to biometric data being processed (Japan APPI).</li>
+          <li><strong>Withdrawal:</strong> use <em>Delete face data</em> on the roster at any time. Attendance can still be taken manually.</li>
+        </ul>
+        <label class="check"><input type="checkbox" id="consent-ok"> I understand and consent has been obtained.</label>
+        <button class="primary" id="b-consent" disabled>Continue to enrolment</button>
+      </div>
+      <div class="kiosk" id="enroll-wrap" hidden>
+        <div>
+          <form id="f-student">
+            <input name="name" placeholder="Student name" maxlength="60" required>
+            <div class="scan"><video id="enroll-video" class="cam" playsinline muted></video><div class="guide"></div><div class="hint" id="enroll-hint">Camera starts…</div></div>
+            <label class="check"><input type="checkbox" name="guardian" required> Guardian / school consent obtained for this student</label>
+            <button class="primary" id="b-capture">Capture face &amp; add student</button>
+            <button type="button" class="link" id="b-cancel-re" hidden>Cancel re-enrol</button>
+          </form>
+        </div>
+        <aside class="side">
+          <h3>Roster (<span id="s-count">0</span>)</h3>
+          <ul id="s-list" class="roster"></ul>
+        </aside>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Manual picker (fallback when the face is not recognised, or for students without face data) -->
+<div id="picker" class="modal" hidden>
+  <div class="modal-box">
+    <h3 id="picker-title">Mark student present</h3>
+    <input id="picker-q" placeholder="Search name…" autocomplete="off">
+    <ul id="picker-list" class="roster"></ul>
+    <button id="picker-close">Cancel</button>
+  </div>
+</div>
+
+<script src="/vendor/face-api.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
