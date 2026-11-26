@@ -124,9 +124,11 @@ export function toGray(rgba) {
 }
 
 // ---------- texture: Competitive Code ----------
-/** Gabor parameters for a ROI_SIZE ROI. Palm lines at 128 px are ~3-6 px wide; wavelength ~10 px matches them.
- *  sigmaAlong > sigmaAcross: the kernel is elongated along the line direction to integrate along creases. */
-export const GABOR = { wavelength: 10, sigmaAcross: 4.5, sigmaAlong: 7, size: 25 };
+/** Gabor parameters for a ROI_SIZE ROI. sigmaAlong > sigmaAcross: elongated along the line to integrate along creases.
+ *  Wavelength 14 (principal lines and big creases, not fine wrinkles) won the sweep on 11K Hands palm photos
+ *  (60 people, scripts/palm-eval-11k.mjs): EER 2.7-4.1% vs 4.1-4.9% at 10, and better at 640x480 too, because fine
+ *  wrinkles move with the hand pose while principal lines do not. */
+export const GABOR = { wavelength: 14, sigmaAcross: 6.3, sigmaAlong: 9.8, size: 35 };
 
 /** Even (cosine) Gabor kernels, zero-mean so flat skin and lighting offsets give 0. Kernel k responds most negatively
  *  to a dark line at angle k·180°/n (dark crease on lighter skin). Row-major size x size each. */
@@ -269,7 +271,8 @@ export class PalmMatcher {
   /** Same accept rules as MatchingService: threshold, absolute gap AND ratio to the runner-up, mean of k nearest samples.
    *  Distance = texture Hamming (0..1) + geomWeight * geometry distance. geomWeight 0 until the spike shows geometry helps.
    *  @param {{threshold?: number, gap?: number, ratio?: number, k?: number, geomWeight?: number, maxShift?: number}} [opts] */
-  constructor({ threshold = 0.38, gap = 0.03, ratio = 0.9, k = 2, geomWeight = 0, maxShift = 2 } = {}) {
+  // threshold 0.37 / maxShift 3: just under the closest different-person pair on 11K Hands at wavelength 14 (0.381-0.389).
+  constructor({ threshold = 0.37, gap = 0.03, ratio = 0.9, k = 2, geomWeight = 0, maxShift = 3 } = {}) {
     this.threshold = threshold; this.gap = gap; this.ratio = ratio; this.k = k; this.geomWeight = geomWeight; this.maxShift = maxShift;
   }
 

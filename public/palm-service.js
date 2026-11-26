@@ -11,11 +11,14 @@ import {
  *   roi: import('./palm.js').Roi, signals: PalmSignals, code: Uint32Array, geom: number[], gray: Float32Array}} PalmFrame */
 
 const now = () => performance.now();
+/** @param {HTMLVideoElement | HTMLCanvasElement} s */
+const size = (s) => ('videoWidth' in s ? { W: s.videoWidth, H: s.videoHeight } : { W: s.width, H: s.height });
 
 export class PalmService {
-  /** @param {{tf?: any, base?: string}} [opts] tf: the TensorFlow.js instance from face-api (faceapi.tf) for the GPU filter bank */
-  constructor({ tf = null, base = '/vendor/mediapipe' } = {}) {
-    this.tf = tf; this.base = base; this._ready = null;
+  /** @param {{tf?: any, base?: string, mode?: 'VIDEO' | 'IMAGE'}} [opts] tf: the TensorFlow.js instance from face-api (faceapi.tf)
+   *  for the GPU filter bank. mode: VIDEO for the camera (tracks between frames), IMAGE for unrelated still photos. */
+  constructor({ tf = null, base = '/vendor/mediapipe', mode = 'VIDEO' } = {}) {
+    this.tf = tf; this.base = base; this.mode = mode; this._ready = null;
     /** @type {any} */ this.landmarker = null;
     this.bank = gaborBank();
     this.roiCanvas = Object.assign(document.createElement('canvas'), { width: ROI_SIZE, height: ROI_SIZE });
@@ -32,7 +35,7 @@ export class PalmService {
       const files = await FilesetResolver.forVisionTasks(`${this.base}/wasm`);
       const make = (/** @type {'GPU' | 'CPU'} */ delegate) => HandLandmarker.createFromOptions(files, {
         baseOptions: { modelAssetPath: `${this.base}/models/hand_landmarker.task`, delegate },
-        runningMode: 'VIDEO', numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+        runningMode: this.mode, numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
       });
       try { this.landmarker = await make('GPU'); this.delegate = 'GPU'; } catch { this.landmarker = await make('CPU'); this.delegate = 'CPU'; }
       if (this.tf) {
@@ -47,11 +50,15 @@ export class PalmService {
   /** Landmarks for every hand in the current video frame (raw, un-mirrored frame for enrolment and scanning alike).
    *  Handedness is used as MediaPipe reports it: measured on its own right_hands.jpg (backs of two right hands, a plain
    *  photo) it says "Right", and "Left" for the mirrored photo, despite the docs saying it assumes a mirrored selfie.
-   *  @param {HTMLVideoElement} video */
-  detect(video) {
-    const W = video.videoWidth, H = video.videoHeight, t0 = now();
-    const ts = Math.max(this.lastTs + 1, t0); this.lastTs = ts; // VIDEO mode needs strictly increasing timestamps
-    const r = this.landmarker.detectForVideo(video, ts);
+   *  @param {HTMLVideoElement | HTMLCanvasElement} src */
+  detect(src) {
+    const { W, H } = size(src), t0 = now();
+    let r;
+    if (this.mode === 'IMAGE') r = this.landmarker.detect(src);
+    else {
+      const ts = Math.max(this.lastTs + 1, t0); this.lastTs = ts; // VIDEO mode needs strictly increasing timestamps
+      r = this.landmarker.detectForVideo(src, ts);
+    }
     this.timing.detect = now() - t0;
     return (r.landmarks ?? []).map((/** @type {any[]} */ lm, /** @type {number} */ i) => {
       const pts = lm.map((p) => ({ x: p.x * W, y: p.y * H, z: p.z * W }));
@@ -63,9 +70,9 @@ export class PalmService {
     });
   }
 
-  /** Detect -> ROI -> quality signals -> code, for every hand. @param {HTMLVideoElement} video @returns {PalmFrame[]} */
+  /** Detect -> ROI -> quality signals -> code, for every hand. @param {HTMLVideoElement | HTMLCanvasElement} video @returns {PalmFrame[]} */
   analyze(video) {
-    const W = video.videoWidth, H = video.videoHeight;
+    const { W, H } = size(video);
     const out = [];
     let warp = 0, code = 0;
     for (const h of this.detect(video)) {

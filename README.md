@@ -120,7 +120,8 @@ The kiosk integration waits on the go/no-go below, because contactless palmprint
 ```bash
 npm run models       # once: downloads MediaPipe hand_landmarker.task (~7.5 MB) into ./models (gitignored)
 npm start            # then open http://localhost:3009/palm-spike.html (no login)
-npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.38] [--geom 0.5]
+npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.37] [--wavelength 14] [--geom 0.5]
+node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--per 8] [--webcam]   # public dataset run, see below
 ```
 
 | Step | Where | Notes |
@@ -129,7 +130,21 @@ npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session]
 | Palm ROI | `palmRoi` | 128 px square below the knuckle line (index MCP 5 to pinky MCP 17), rotated upright, never mirrored. ~3 ms canvas warp |
 | Quality gate | `palmQuality` | palm (not the back of the hand) facing, fingers open, flat to the camera, size, light, blur. Lenient `SCAN_PALM`, strict `ENROLL_PALM` |
 | Texture code | `encodeCompCode` | Competitive Code: 6 oriented Gabor filters, winning orientation per point on a 32×32 grid (3 bits) + a mask for low-contrast points. One `tf.conv2d` on face-api's TensorFlow.js: **1.2 ms GPU** (4.6 ms in plain JS, identical code) |
-| Match | `PalmMatcher` | shift-tolerant (±2 cells) Hamming distance, same accept rules as faces (threshold, gap, ratio, mean of 2 nearest); same-hand templates only. Optional hand-geometry term (`geomWeight`, off until data shows it helps) |
+| Match | `PalmMatcher` | shift-tolerant (±3 cells) Hamming distance, same accept rules as faces (threshold, gap, ratio, mean of 2 nearest); same-hand templates only. Optional hand-geometry term (`geomWeight`, off until data shows it helps) |
+
+**Public-dataset run (2026-11-26).** [11K Hands](https://sites.google.com/view/11khands) (Afifi 2019, academic use; not committed) palm photos, 60 people, 8 photos per hand, each person's photos split into an "enrol" half and a "scan" half. `--webcam` shrinks each photo to 640×480 and recompresses it at JPEG quality 70.
+
+| | full 1600×1200 | webcam-like 640×480 |
+|---|---|---|
+| hand found / correct hand + palm side | 99.9% / 97.2% | 100% / 97.2% |
+| pass the scan gate | 51% (most rejects: wrist cut off by the photo, ROI leaves the frame) | 42% (+ blur) |
+| pass the enrol gate | 46% | **9%** (blur, palm < 140 px) |
+| EER (λ=14) | 4.1% | 2.7% |
+| kiosk replay, one photo, threshold just under the closest impostor | 92.2% right, 0 wrong | 92.2% right, 0 wrong (at 0.37: 89.5%) |
+| hand geometry alone | EER 30% (useless; kept at weight 0) | EER 30% |
+
+Wavelength sweep (EER, webcam-like): λ=10 4.1%, 12 ~3.5%, **14 2.7%**, 16 2.7% (but fewer right at a safe threshold), 18 2.7%. Coarser filters follow principal lines, which stay put when the hand pose changes; fine wrinkles move. Resolution is not the limit (640×480 ≈ full res); ROI alignment between poses is.
+Caveats: each person's photos come from one sitting (no day-to-day change; optimistic), but every photo is an independent pose with no tracking (pessimistic). The margin is thin: the closest different-person pair is only ~0.02 above the threshold.
 
 **Protocol:** 8–10 people. Right hand by default ("allow left hand" for both). Per person: *Capture 10* with the strict gate on day 1, then again on another day (different session label) with the lenient gate, under the classroom lighting. Export JSON after each sitting (samples live only in this browser's localStorage).
 **Go/no-go** (report with "genuine = different sessions only"): kiosk replay has **0 WRONG person**, and ≥ 95% right once 2–3 frames are fused (the single-frame replay is the pessimistic case). If not, try `--sweep`; if no Gabor setting gets there, the next step is a trained palm model (CCNet-style, ONNX Runtime Web) behind the same matcher. Check dataset licences: Tongji, IITD and MPD are mostly research-only.

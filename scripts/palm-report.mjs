@@ -2,7 +2,8 @@
 //   node scripts/palm-report.mjs palm-samples.json                    # stored codes, as captured live
 //   node scripts/palm-report.mjs palm-samples.json --reencode         # recompute codes from the saved ROI JPEGs
 //   node scripts/palm-report.mjs palm-samples.json --sweep            # try several Gabor settings (implies --reencode)
-//   options: --same-session (count same-session genuine pairs too)  --threshold 0.38  --geom 0.5  --shift 2
+//   --wavelength 12 (with --reencode): one Gabor bank scaled to that wavelength
+//   options: --same-session (count same-session genuine pairs too)  --threshold 0.37  --geom 0.5  --shift 3
 import fs from 'node:fs';
 import sharp from 'sharp';
 import {
@@ -16,7 +17,7 @@ const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number
 if (!file) { console.error('usage: node scripts/palm-report.mjs <export.json> [--reencode] [--sweep] [--same-session] [--threshold t] [--geom w] [--shift s]'); process.exit(1); }
 
 const raw = JSON.parse(fs.readFileSync(file, 'utf8')).samples;
-const crossSession = !flag('same-session'), threshold = num('threshold', 0.38), geomWeight = num('geom', 0), maxShift = num('shift', 2);
+const crossSession = !flag('same-session'), threshold = num('threshold', 0.37), geomWeight = num('geom', 0), maxShift = num('shift', 3);
 const people = new Set(raw.map((s) => s.person)), sessions = new Set(raw.map((s) => s.session));
 console.log(`${raw.length} samples, ${people.size} people, ${sessions.size} sessions; genuine pairs: ${crossSession ? 'different sessions only' : 'all'}`);
 if (crossSession && sessions.size < 2) console.log('  (only one session: use --same-session, or capture a second day for the realistic number)');
@@ -60,9 +61,9 @@ else {
   const missing = grays.filter((g) => !g).length;
   if (missing) console.log(`  ${missing} samples have no ROI image and are skipped`);
   const settings = flag('sweep')
-    ? [GABOR, { ...GABOR, wavelength: 8, sigmaAcross: 3.6, sigmaAlong: 5.5, size: 21 }, { ...GABOR, wavelength: 12, sigmaAcross: 5.4, sigmaAlong: 8.5, size: 29 },
-      { ...GABOR, sigmaAlong: GABOR.sigmaAcross }, { ...GABOR, sigmaAlong: 10, size: 31 }]
-    : [GABOR];
+    ? [10, 12, 14, 16, 18].map((w) => ({ wavelength: w, sigmaAcross: w * 0.45, sigmaAlong: w * 0.7, size: 2 * Math.ceil(w * 1.2) + 1 }))
+    : num('wavelength', 0) ? [{ wavelength: num('wavelength', 10), sigmaAcross: num('wavelength', 10) * 0.45, sigmaAlong: num('wavelength', 10) * 0.7, size: 2 * Math.ceil(num('wavelength', 10) * 1.2) + 1 }]
+      : [GABOR];
   for (const p of settings) {
     const bank = gaborBank(6, p);
     run(`re-encoded λ=${p.wavelength} σ⊥=${p.sigmaAcross} σ∥=${p.sigmaAlong} k=${p.size}`, grays.map((g) => (g ? encodeCompCode(filterResponses(g, ROI_SIZE, ROI_SIZE, bank, p.size)) : null)));
