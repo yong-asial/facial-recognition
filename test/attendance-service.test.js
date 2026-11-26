@@ -60,3 +60,19 @@ test('cancel removes a queued scan (undo before sync)', async () => {
   assert.equal(svc.cancel(1, 7), false);
   assert.equal(svc.pending(), 0);
 });
+
+test('method (face / palm) is sent, kept through the offline queue, and old queue items default to face', async () => {
+  let online = true;
+  const { svc, calls } = make((s, st, t) => { if (!online) throw netErr(); return { scannedAt: t }; });
+  await svc.mark(1, 7, 'palm');
+  assert.equal(calls.at(-1)[3], 'palm');
+  await svc.mark(1, 8);
+  assert.equal(calls.at(-1)[3], 'face', 'default');
+  online = false;
+  await svc.mark(1, 9, 'palm');
+  assert.equal(svc.queue()[0].method, 'palm');
+  svc.save([...svc.queue(), { sessionId: 1, studentId: 10, scannedAt: 5 }]); // queued by an older version, no method
+  online = true;
+  await svc.flush();
+  assert.deepEqual(calls.slice(-2).map((c) => [c[1], c[3]]), [[9, 'palm'], [10, 'face']]);
+});

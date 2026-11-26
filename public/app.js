@@ -40,7 +40,7 @@ const UNDO_COOLDOWN_MS = 15000;
 const face = new FaceService(window.faceapi);
 const matcher = new MatchingService({ threshold: 0.5, gap: 0.04, ratio: 0.8, k: 2 });
 const attendance = new AttendanceService({
-  send: (sessionId, studentId, scannedAt) => Api.markPresent(sessionId, studentId, scannedAt),
+  send: (sessionId, studentId, scannedAt, method) => Api.markPresent(sessionId, studentId, scannedAt, method),
   storage: safe(() => localStorage) ?? undefined,
   onChange: (n) => renderQueue(n),
 });

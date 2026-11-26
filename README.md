@@ -7,7 +7,7 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (93)
+npm test             # unit + API tests (100)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
 ```
 
@@ -61,7 +61,8 @@ Mirroring: the video is only mirrored by CSS for display. Detection and embeddin
 - Stored per student: **embeddings + one 96px thumbnail**, **AES-256-GCM encrypted at rest** ([crypto-store.js](crypto-store.js)). Key = `FACE_DATA_KEY` (64 hex chars) or an auto-generated `data/face.key` (mode 0600). **Back the key up and keep it out of git**: without it the face data cannot be decrypted.
 - Enrolment requires explicit consent (notice + per-student guardian checkbox, stored as `consent_at`). Students are minors and biometric data falls under Japan's APPI: get your legal/school sign-off before real use.
 - **Delete face data** erases the template + thumbnail and keeps the student for manual attendance. **Remove** deletes everything.
-- Descriptors are decrypted by the server and sent to the teacher's browser for matching. Use HTTPS in any real deployment.
+- Palm (when enrolled): only the hand (Left/Right) and its 512-byte palm-line code per template (max 10 per hand), in a **separate encrypted column** `palm_data` with its own `palm_consent_at`. No palm image and no hand geometry are stored. `DELETE /api/students/:id/palm[?hand=Left|Right]` withdraws one hand or all palm data without touching the face data.
+- Descriptors and palm codes are decrypted by the server and sent to the teacher's browser for matching. Use HTTPS in any real deployment.
 - Old PoC tables (`students`, `attendance`) are renamed `*_legacy` on first start, not deleted.
 
 ## Tuning the threshold
@@ -113,7 +114,7 @@ ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/C.jpg -vf "$V" -pix_fmt yuv4
 ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/A.jpg -vf "$V,perspective=x0=0:y0='0.13*H*sin(2*PI*on/12)':x1=W:y1='-0.13*H*sin(2*PI*on/12)':x2=0:y2='H-0.13*H*sin(2*PI*on/12)':x3=W:y3='H+0.13*H*sin(2*PI*on/12)':eval=frame:sense=destination" -pix_fmt yuv420p /tmp/e2e/camLive.y4m
 ```
 
-## Palm scanning (feasibility spike, not in the kiosk yet)
+## Palm scanning (backend ready, kiosk UI next)
 Goal: check-in by showing an open palm to the same camera, faster than face (target < 1 s from palm in view to "Present").
 The kiosk integration waits on the go/no-go below, because contactless palmprint on a webcam/iPad camera is far less accurate than published numbers (lab lighting, contact scanners).
 
@@ -150,6 +151,8 @@ Frame fusion (webcam-like, threshold 0.38, enrol/scan halves): 1 frame **92.2%**
 
 Wavelength sweep (EER, webcam-like): λ=10 4.1%, 12 ~3.5%, **14 2.7%**, 16 2.7% (but fewer right at a safe threshold), 18 2.7%. Coarser filters follow principal lines, which stay put when the hand pose changes; fine wrinkles move. Resolution is not the limit (640×480 ≈ full res); ROI alignment between poses is.
 Caveats: each person's photos come from one sitting (no day-to-day change; optimistic), but every photo is an independent pose with no tracking (pessimistic). The margin is thin: the closest different-person pair is only ~0.02 above the threshold.
+
+**API (Phase 3):** `POST /api/students` takes `descriptors`, `palm` (`[{hand, code}]`, base64 code from `codeToBase64`) or both, each with `consent: true`; `PUT /api/students/:id/palm` enrols / re-enrols the hands in the request and keeps the other hand; `DELETE /api/students/:id/palm[?hand=]`; `GET /api/students` adds `hasPalm` and `palms`. `POST /api/sessions/:id/attendance` takes `method: 'face' | 'palm'` (default face; kept through the offline queue; shown in the CSV "Method" column). No learned-template pool for palms yet.
 
 **Protocol:** 8–10 people. Right hand by default ("allow left hand" for both). Per person: *Capture 10* with the strict gate on day 1, then again on another day (different session label) with the lenient gate, under the classroom lighting. Export JSON after each sitting (samples live only in this browser's localStorage).
 **Go/no-go** (report with "genuine = different sessions only"): kiosk replay has **0 WRONG person**, and ≥ 95% right once 2–3 frames are fused (the single-frame replay is the pessimistic case). If not, try `--sweep`; if no Gabor setting gets there, the next step is a trained palm model (CCNet-style, ONNX Runtime Web) behind the same matcher. Check dataset licences: Tongji, IITD and MPD are mostly research-only.

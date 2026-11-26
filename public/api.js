@@ -25,6 +25,10 @@ export const Api = {
   // students / face data
   students: async () => (await json('/students')).students,
   addStudent: async (name, descriptors, thumbnail) => (await json('/students', { name, descriptors, thumbnail, consent: true })).student,
+  /** palm: [{hand: 'Left'|'Right', code: base64}] (codeToBase64 in palm.js); a student may have palm data only. */
+  addPalmStudent: async (name, palm) => (await json('/students', { name, palm, consent: true })).student,
+  enrollPalm: async (id, palm) => (await json(`/students/${id}/palm`, { palm, consent: true }, 'PUT')).student,
+  deletePalm: async (id, hand) => (await json(`/students/${id}/palm${hand ? `?hand=${hand}` : ''}`, undefined, 'DELETE')).student,
   reenroll: async (id, descriptors, thumbnail) => (await json(`/students/${id}/face`, { descriptors, thumbnail, consent: true }, 'PUT')).student,
   learnFace: (id, sessionId, descriptor) => call(`/students/${id}/face/learned`, { sessionId, descriptor }),
   forgetFace: (id, sessionId) => call(`/students/${id}/face/learned/${sessionId}`, undefined, 'DELETE'),
@@ -35,7 +39,7 @@ export const Api = {
   startSession: async (name) => (await json('/sessions', { name })).session,
   session: (id) => json(`/sessions/${id}`),
   endSession: async (id) => (await json(`/sessions/${id}/end`, {})).session,
-  markPresent: (sessionId, studentId, scannedAt) => json(`/sessions/${sessionId}/attendance`, { studentId, scannedAt }),
+  markPresent: (sessionId, studentId, scannedAt, method = 'face') => json(`/sessions/${sessionId}/attendance`, { studentId, scannedAt, method }),
   setPresent: (sessionId, studentId, present) => json(`/sessions/${sessionId}/attendance/${studentId}`, { present }, 'PUT'),
   csv: async (id) => (await call(`/sessions/${id}/csv`)).blob(),
 };

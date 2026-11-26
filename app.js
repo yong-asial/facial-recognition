@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as defaultOllama from './ollama.js';
 import { createCipher } from './crypto-store.js';
+import { CODE_WORDS } from './public/palm.js';
 
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
 export const FACE_THRESHOLD = Number(process.env.FACE_THRESHOLD || 0.5); // euclidean distance, lower = stricter
@@ -137,7 +138,7 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
 
   // ---------- attendance ----------
   // Teachers own students. The browser matches faces locally against /api/students (decrypted descriptors)
-  // and only reports the matched student id. Face data (descriptors + thumbnail) is encrypted at rest.
+  // and only reports the matched student id. Face data (descriptors + thumbnail) and palm templates are encrypted at rest.
   const cipher = defaultCipher ?? createCipher({ keyFile: dbPath === ':memory:' ? undefined : path.join(path.dirname(dbPath), 'face.key') });
   const hasCol = (t, c) => db.prepare(`PRAGMA table_info(${t})`).all().some((r) => r.name === c);
   // Older PoC schema (plaintext descriptors, per-day attendance): keep the data under a *_legacy name.
@@ -159,14 +160,19 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
       PRIMARY KEY (session_id, student_id)
     );
   `);
+  // Palm templates: own encrypted column + consent time, so face and palm can be withdrawn independently.
+  if (!hasCol('students', 'palm_data')) db.exec('ALTER TABLE students ADD COLUMN palm_data TEXT; ALTER TABLE students ADD COLUMN palm_consent_at INTEGER;');
   const pad = (n) => String(n).padStart(2, '0');
   const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
   const validThumb = (t) => typeof t === 'string' && /^data:image\/jpeg;base64,/.test(t) && t.length < 40_000;
   const faceOf = (row) => (row.face_data ? cipher.decrypt(row.face_data) : { descriptors: [], thumbnail: null });
   // descriptors = enrolment samples + samples learned from confident scans (kept apart, capped, never replace the enrolment).
+  const palmOf = (row) => (row.palm_data ? cipher.decrypt(row.palm_data) : { templates: [] });
+  // palms: Competitive Code templates (base64, see public/palm.js) the browser matches against, like descriptors.
   const publicStudent = (row) => {
-    const f = faceOf(row);
-    return { id: row.id, name: row.name, hasFace: f.descriptors.length > 0, descriptors: [...f.descriptors, ...(f.learned ?? []).map((l) => l.descriptor)], thumbnail: f.thumbnail };
+    const f = faceOf(row), p = palmOf(row);
+    return { id: row.id, name: row.name, hasFace: f.descriptors.length > 0, descriptors: [...f.descriptors, ...(f.learned ?? []).map((l) => l.descriptor)], thumbnail: f.thumbnail,
+      hasPalm: p.templates.length > 0, palms: p.templates.map(({ hand, code }) => ({ hand, code })) };
   };
 
   app.get('/api/students', auth, (req, res) => {
@@ -184,13 +190,30 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
     return { face: { descriptors, thumbnail: thumbnail ?? null } };
   }
 
+  // Palm: only the hand and the 512-byte code are kept (no palm image, no hand geometry). Up to 10 templates per hand.
+  const PALM_CODE_BYTES = CODE_WORDS * 4, PALM_PER_HAND = 10;
+  const validPalm = (t) => t && (t.hand === 'Left' || t.hand === 'Right') && typeof t.code === 'string'
+    && /^[A-Za-z0-9+/]+={0,2}$/.test(t.code) && Buffer.from(t.code, 'base64').length === PALM_CODE_BYTES;
+  function parsePalm(body) {
+    const { palm, consent } = body || {};
+    if (consent !== true) return { error: 'Consent is required before storing palm data.' };
+    if (!Array.isArray(palm) || palm.length < 1 || !palm.every(validPalm)) return { error: 'Invalid palm data.' };
+    for (const hand of ['Left', 'Right']) if (palm.filter((t) => t.hand === hand).length > PALM_PER_HAND) return { error: `At most ${PALM_PER_HAND} palm templates per hand.` };
+    return { templates: palm.map(({ hand, code }) => ({ hand, code })) };
+  }
+
+  // A student is created with face data, palm data, or both (each needs consent).
   app.post('/api/students', auth, (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name || name.length > 60) return res.status(400).json({ error: 'Name must be 1-60 characters.' });
-    const { face, error } = parseFace(req.body);
+    const wantsFace = req.body?.descriptors !== undefined, wantsPalm = req.body?.palm !== undefined;
+    if (!wantsFace && !wantsPalm) return res.status(400).json({ error: 'Face or palm data is required.' });
+    const f = wantsFace ? parseFace(req.body) : null, p = wantsPalm ? parsePalm(req.body) : null;
+    const error = f?.error ?? p?.error;
     if (error) return res.status(400).json({ error });
-    const r = db.prepare('INSERT INTO students (teacher_id,name,face_data,consent_at,created_at) VALUES (?,?,?,?,?)')
-      .run(req.user.id, name, cipher.encrypt(face), Date.now(), Date.now());
+    const now = Date.now();
+    const r = db.prepare('INSERT INTO students (teacher_id,name,face_data,consent_at,palm_data,palm_consent_at,created_at) VALUES (?,?,?,?,?,?,?)')
+      .run(req.user.id, name, f ? cipher.encrypt(f.face) : null, f ? now : null, p ? cipher.encrypt({ templates: p.templates }) : null, p ? now : null, now);
     res.json({ student: publicStudent(db.prepare('SELECT * FROM students WHERE id=?').get(r.lastInsertRowid)) });
   });
 
@@ -230,6 +253,31 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
       db.prepare('UPDATE students SET face_data=? WHERE id=?').run(cipher.encrypt({ ...f, learned }), row.id);
     }
     res.json({ ok: true });
+  });
+
+  // Enrol / re-enrol palms. Replaces the templates of the hands in the request and keeps the other hand
+  // (re-enrolling the right hand does not wipe the left).
+  app.put('/api/students/:id/palm', auth, (req, res) => {
+    const row = ownStudent(req);
+    if (!row) return res.status(404).json({ error: 'Student not found.' });
+    const { templates, error } = parsePalm(req.body);
+    if (error) return res.status(400).json({ error });
+    const hands = new Set(templates.map((t) => t.hand));
+    const merged = [...palmOf(row).templates.filter((t) => !hands.has(t.hand)), ...templates];
+    db.prepare('UPDATE students SET palm_data=?, palm_consent_at=? WHERE id=?').run(cipher.encrypt({ templates: merged }), Date.now(), row.id);
+    res.json({ student: publicStudent(ownStudent(req)) });
+  });
+
+  // Withdraw palm consent: erase one hand (?hand=Left|Right) or all palm data. Face data and the student stay.
+  app.delete('/api/students/:id/palm', auth, (req, res) => {
+    const row = ownStudent(req);
+    if (!row) return res.status(404).json({ error: 'Student not found.' });
+    const hand = req.query.hand;
+    if (hand !== undefined && hand !== 'Left' && hand !== 'Right') return res.status(400).json({ error: 'hand must be Left or Right.' });
+    const rest = hand ? palmOf(row).templates.filter((t) => t.hand !== hand) : [];
+    if (rest.length) db.prepare('UPDATE students SET palm_data=? WHERE id=?').run(cipher.encrypt({ templates: rest }), row.id);
+    else db.prepare('UPDATE students SET palm_data=NULL, palm_consent_at=NULL WHERE id=?').run(row.id);
+    res.json({ student: publicStudent(ownStudent(req)) });
   });
 
   // Withdraw biometric consent: erase face data but keep the student on the roster (manual attendance only).
@@ -283,7 +331,8 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
     res.json({ session: sessionOut(ownSession(req)) });
   });
 
-  // Face scan result. Idempotent: a second scan of the same student reports already=true.
+  // Face or palm scan result (method, default face; the CSV "Method" column shows it). Idempotent: a second scan of the
+  // same student reports already=true and keeps the first method.
   // scannedAt lets an offline kiosk replay queued scans with their real time.
   app.post('/api/sessions/:id/attendance', auth, (req, res) => {
     const s = ownSession(req);
@@ -291,9 +340,11 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
     if (s.ended_at != null) return res.status(409).json({ error: 'Session has ended.' });
     const st = db.prepare('SELECT id, name FROM students WHERE id=? AND teacher_id=?').get(req.body?.studentId, req.user.id);
     if (!st) return res.status(404).json({ error: 'Student not found.' });
+    const method = req.body?.method ?? 'face';
+    if (method !== 'face' && method !== 'palm') return res.status(400).json({ error: 'method must be face or palm.' });
     const t = Number(req.body?.scannedAt);
     const at = Number.isFinite(t) && t > s.started_at - 1000 && t <= Date.now() + 60_000 ? t : Date.now();
-    const r = db.prepare("INSERT OR IGNORE INTO attendance VALUES (?,?,'face',?)").run(s.id, st.id, at);
+    const r = db.prepare('INSERT OR IGNORE INTO attendance VALUES (?,?,?,?)').run(s.id, st.id, method, at);
     const row = db.prepare('SELECT scanned_at AS at FROM attendance WHERE session_id=? AND student_id=?').get(s.id, st.id);
     res.json({ student: st, already: !r.changes, scannedAt: row.at });
   });

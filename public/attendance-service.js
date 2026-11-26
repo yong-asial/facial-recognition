@@ -2,12 +2,13 @@
 // AttendanceService: sends scans to the backend, queues them when offline, replays them later.
 // Kiosk keeps working through a Wi-Fi drop; queued scans keep their real timestamp.
 
-/** @typedef {{sessionId: number, studentId: number, scannedAt: number}} QueuedScan */
+/** @typedef {'face' | 'palm'} Method */
+/** @typedef {{sessionId: number, studentId: number, scannedAt: number, method?: Method}} QueuedScan  method missing = face (older queues) */
 /** @typedef {{already?: boolean, scannedAt: number}} SendResult */
 
 export class AttendanceService {
   /** @param {{
-   *   send: (sessionId: number, studentId: number, scannedAt: number) => Promise<SendResult>,
+   *   send: (sessionId: number, studentId: number, scannedAt: number, method: Method) => Promise<SendResult>,
    *   storage?: {getItem(k: string): string | null, setItem(k: string, v: string): void},
    *   now?: () => number, key?: string, onChange?: (pending: number) => void }} deps
    *  send must throw an Error with `.status` for HTTP errors; anything without `.status` is a network failure. */
@@ -24,17 +25,17 @@ export class AttendanceService {
   save(q) { try { this.storage?.setItem(this.key, JSON.stringify(q)); } catch { /* storage full/blocked: queue is best-effort */ } this.onChange(q.length); }
   pending() { return this.queue().length; }
 
-  /** @param {number} sessionId @param {number} studentId
+  /** @param {number} sessionId @param {number} studentId @param {Method} [method]
    *  @returns {Promise<{status: 'saved', already: boolean, scannedAt: number} | {status: 'queued', scannedAt: number}>} */
-  async mark(sessionId, studentId) {
+  async mark(sessionId, studentId, method = 'face') {
     const scannedAt = this.now();
     try {
-      const r = await this.send(sessionId, studentId, scannedAt);
+      const r = await this.send(sessionId, studentId, scannedAt, method);
       return { status: 'saved', already: !!r.already, scannedAt: r.scannedAt };
     } catch (e) {
       if (/** @type {{status?: number}} */ (e).status) throw e; // server said no: not a connectivity problem
       const q = this.queue();
-      if (!q.some((x) => x.sessionId === sessionId && x.studentId === studentId)) this.save([...q, { sessionId, studentId, scannedAt }]);
+      if (!q.some((x) => x.sessionId === sessionId && x.studentId === studentId)) this.save([...q, { sessionId, studentId, scannedAt, method }]);
       return { status: 'queued', scannedAt };
     }
   }
@@ -56,7 +57,7 @@ export class AttendanceService {
     try {
       for (const item of this.queue()) {
         try {
-          await this.send(item.sessionId, item.studentId, item.scannedAt);
+          await this.send(item.sessionId, item.studentId, item.scannedAt, item.method ?? 'face');
           sent++;
         } catch (e) {
           const status = /** @type {{status?: number}} */ (e).status;
