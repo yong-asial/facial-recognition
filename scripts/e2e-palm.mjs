@@ -89,7 +89,8 @@ try {
   await withHint(page, until(async () => /Saved Palm Pat/.test(await text(page, '#enroll-hint')), 'palm saved'));
   check(await page.$eval('#enroll-wrap .guide', (g) => !g.classList.contains('palm')), 'and goes back to the face oval afterwards');
   console.log(`  enrolled in ${((Date.now() - te) / 1000).toFixed(1)}s (incl. hand model load)`);
-  check((await text(page, '#s-list')).includes('palm: right'), 'roster shows the palm tag');
+  const rosterHash = (await text(page, '#s-list')).match(/palm: right (#[0-9a-f]{8})/)?.[1];
+  check(!!rosterHash, `roster shows the palm tag with the stored template's hash (${rosterHash})`);
   check((await text(page, '#s-list')).includes('no face data'), 'palm-only student (no face data)');
   if (process.env.E2E_SHOTS) await page.screenshot({ path: `${process.env.E2E_SHOTS}/palm-enrol.png` });
 
@@ -103,6 +104,9 @@ try {
   await withHint(page, until(async () => (await present(page)) === '1', 'palm check-in'));
   console.log(`  marked ${((Date.now() - ts) / 1000).toFixed(1)}s after switching to palm (model already loaded by enrolment; incl. camera restart)`);
   check((await text(page, '#result-name')) === 'Palm Pat', 'card shows the name');
+  const cardHash = await text(page, '#result-hash');
+  const m = cardHash.match(/^scan (#[0-9a-f]{8}) → matched palm \(right\) template (#[0-9a-f]{8})$/);
+  check(!!m && m[2] === rosterHash && m[1] !== rosterHash, `card shows the scan hash and the matched template hash (same as the roster): "${cardHash}"`);
   check(await page.$eval('#guide', (g) => !g.hidden && g.classList.contains('palm') && getComputedStyle(g.querySelector('.hand')).display === 'block'), 'kiosk position guide is a hand outline in palm mode');
   if (process.env.E2E_SHOTS) await page.screenshot({ path: `${process.env.E2E_SHOTS}/palm-scan.png` });
   await until(async () => /checked in/.test(await text(page, '#kiosk-hint')), 'checked-in hint', 5000);

@@ -64,6 +64,7 @@ Mirroring: the video is only mirrored by CSS for display. Detection and embeddin
 - **Delete face data** erases the template + thumbnail and keeps the student for manual attendance. **Remove** deletes everything.
 - Palm (when enrolled): only the hand (Left/Right) and its 512-byte palm-line code per template (max 10 per hand), in a **separate encrypted column** `palm_data` with its own `palm_consent_at`. No palm image and no hand geometry are stored. `DELETE /api/students/:id/palm[?hand=Left|Right]` withdraws one hand or all palm data without touching the face data.
 - Descriptors and palm codes are decrypted by the server and sent to the teacher's browser for matching. Use HTTPS in any real deployment.
+- **Template hashes (display only):** the roster shows `face #xxxxxxxx` and `palm: right #xxxxxxxx`, the first 8 hex digits of SHA-256 over the stored template (all face samples incl. learned ones; per hand, current-version palm templates). The check-in card shows `scan #… → matched face/palm template #…`. A hash identifies an exact template, not a person: every scan hashes differently (matching is by distance), and the stored hash changes on re-enrol or when a face sample is learned. Nothing is stored or compared by hash.
 - Old PoC tables (`students`, `attendance`) are renamed `*_legacy` on first start, not deleted.
 
 ## Tuning the threshold

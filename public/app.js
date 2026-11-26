@@ -80,6 +80,24 @@ function msg(text = '', ok = false) { const m = $('#msg'); m.textContent = text;
 function hint(sel, text, kind = '') { const el = $(sel); el.textContent = text; el.className = 'hint ' + kind; }
 const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
 
+// ---------- template fingerprints (display only) ----------
+// First 8 hex digits of SHA-256 over the raw template bytes. They identify an exact stored template (or one scan);
+// two scans of the same person always hash differently, because matching is by distance, never by equal hashes.
+const fingerprint = async (bytes) => '#' + [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].slice(0, 4).map((b) => b.toString(16).padStart(2, '0')).join('');
+const faceBytes = (descriptors) => new Uint8Array(Float32Array.from(descriptors.flat()).buffer);
+const palmBytes = (codes) => { const out = new Uint8Array(codes.reduce((n, c) => n + c.byteLength, 0)); let o = 0; for (const c of codes) { out.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), o); o += c.byteLength; } return out; };
+/** Adds faceHash (all face samples, incl. learned ones) and palmHash[hand] (current-version templates) to each student. */
+async function addFingerprints(list) {
+  await Promise.all(list.map(async (s) => {
+    s.faceHash = s.descriptors?.length ? await fingerprint(faceBytes(s.descriptors)) : null;
+    s.palmHash = {};
+    for (const hand of ['Right', 'Left']) {
+      const codes = currentPalms(s).filter((p) => p.hand === hand).map((p) => codeFromBase64(p.code));
+      if (codes.length) s.palmHash[hand] = await fingerprint(palmBytes(codes));
+    }
+  }));
+}
+
 // ---------- position guide: an oval for faces, an open-hand outline for palms ----------
 // The hand is drawn as a silhouette (a dashed outline masked so finger/palm overlaps don't show), thumb on the left:
 // how a right palm looks in the mirrored front-camera preview. palmGuide() flips it for the left hand / rear camera.
@@ -160,9 +178,9 @@ function renderQueue(n) {
 }
 
 let resultTimer = 0;
-function showResult(kind, { name, sub = '', thumbnail = '', undoId = null, picker = false, ms = RESULT_MS }) {
+function showResult(kind, { name, sub = '', thumbnail = '', undoId = null, picker = false, ms = RESULT_MS, hash = '' }) {
   const r = $('#result'); r.className = 'result ' + kind; r.hidden = false;
-  $('#result-name').textContent = name; $('#result-sub').textContent = sub;
+  $('#result-name').textContent = name; $('#result-sub').textContent = sub; $('#result-hash').textContent = hash;
   const img = $('#result-img'); img.hidden = !thumbnail; if (thumbnail) img.src = thumbnail;
   $('#result-undo').hidden = undoId == null; $('#result-undo').onclick = () => undoMark(undoId, true);
   $('#result-pick').hidden = !picker; $('#result-pick').onclick = () => { r.hidden = true; openPicker('Who is this?', true); };
@@ -178,6 +196,7 @@ async function startScan() {
   let sessions;
   try {
     [students, sessions] = await Promise.all([Api.students(), Api.sessions(), palmMode ? palm.load() : face.load()]);
+    await addFingerprints(students);
   } catch (e) { return hint('#kiosk-hint', 'Could not load: ' + e.message + ' (reload to retry)', 'bad'); }
   if (!alive()) return;
   session = sessions.find((s) => s.active) ?? null;
@@ -265,7 +284,7 @@ async function scanLoop(alive, video) {
         if (r.confirmed) {
           track.handled = id; cooldown.set(id, t + COOLDOWN_MS);
           const learn = q.ok && matcher.shouldAdapt(m) ? track.fused() : null;
-          await handleConfirmed(students.find((s) => s.id === id), alive, learn, track.fused());
+          await handleConfirmed(students.find((s) => s.id === id), alive, learn, track.fused(), 'face', { bytes: faceBytes([track.fused()]) });
           if (!alive()) return;
         }
       } else if (m && r.frames >= CONFIRM_FRAMES) {
@@ -347,7 +366,8 @@ async function palmScanLoop(alive, video) {
         } else if (!confirmed) status ??= [`Hello ${m.student.name}… hold still`, 'ok'];
         if (confirmed) {
           track.handled = id; cooldown.set(id, t + COOLDOWN_MS);
-          await handleConfirmed(students.find((s) => s.id === id), alive, null, null, 'palm');
+          const lastCode = track.frames[track.frames.length - 1].sample.code;
+          await handleConfirmed(students.find((s) => s.id === id), alive, null, null, 'palm', { bytes: palmBytes([lastCode]), hand: track.hand });
           if (!alive()) return;
         }
       } else if (m && r.frames >= PALM_CONFIRM_FRAMES) {
@@ -389,11 +409,15 @@ function drawPalmDebug(dbg, nHands, fps) {
   $('#dbg-text').textContent = lines.join('\n');
 }
 
-/** @param learn fused descriptor to add to the student's template (Face ID-style), or null */
-async function handleConfirmed(student, alive, learn = null, fused = null, method = 'face') {
+/** @param learn fused descriptor to add to the student's template (Face ID-style), or null
+ *  @param scan {bytes, hand?}: the template that was just scanned (fused face descriptor / last palm code), for the card's hash line */
+async function handleConfirmed(student, alive, learn = null, fused = null, method = 'face', scan = null) {
   if (!student) return;
   lastFace = fused ? { descriptor: fused, at: Date.now(), studentId: student.id } : null;
-  const base = { name: student.name, thumbnail: student.thumbnail ?? '' };
+  const stored = method === 'palm' ? student.palmHash?.[scan?.hand] : student.faceHash;
+  const scanHash = scan ? await fingerprint(scan.bytes) : null;
+  const hash = scanHash ? `scan ${scanHash} → matched ${method}${method === 'palm' && scan.hand ? ` (${scan.hand.toLowerCase()})` : ''} template ${stored ?? '—'}` : '';
+  const base = { name: student.name, thumbnail: student.thumbnail ?? '', hash };
   if (present.has(student.id)) return showResult('already', { ...base, sub: 'Already checked in' });
   try {
     const r = await attendance.mark(session.id, student.id, method);
@@ -613,6 +637,7 @@ $('#f-session').addEventListener('submit', async (e) => {
 // ======================================================================
 async function loadRoster() {
   students = await Api.students();
+  await addFingerprints(students);
   $('#s-count').textContent = students.length;
   const ul = $('#s-list'); ul.replaceChildren();
   for (const s of students) {
@@ -648,10 +673,11 @@ async function loadRoster() {
     if (s.thumbnail) who.append(el('img', { src: s.thumbnail, alt: '' }));
     who.append(el('span', { textContent: s.name }));
     if (!s.hasFace) who.append(el('span', { className: 'tag', textContent: '  no face data' }));
+    else who.append(el('span', { className: 'tag hash', textContent: `  face ${s.faceHash}`, title: 'SHA-256 of the stored face template (changes on re-enrol or when a sample is learned)' }));
     if (s.hasPalm) {
       const cur = currentPalms(s), hands = (list) => [...new Set(list.map((p) => p.hand.toLowerCase()))].join(' + ');
       who.append(cur.length === s.palms.length
-        ? el('span', { className: 'tag palm', textContent: `  palm: ${hands(cur)}` })
+        ? el('span', { className: 'tag palm', textContent: `  palm: ${Object.entries(s.palmHash).map(([h, x]) => `${h.toLowerCase()} ${x}`).join(', ')}`, title: 'SHA-256 of the stored palm template per hand' })
         : el('span', { className: 'tag', textContent: `  palm: ${hands(s.palms)} — re-enrol (older format)` }));
     }
     ul.append(el('li', {}, who, actions));

@@ -73,3 +73,5 @@ button.warn{background:#b45309;border-color:#b45309}
 .guide.palm{border:none;border-radius:0;inset:4% 24%;color:#ffffff88}
 .guide.palm .hand{display:block}.guide.palm.flip .hand{transform:scaleX(-1)}
 .guide.palm.ok{color:#4ade80}.guide.palm.warn{color:#fbbf24}.guide.palm.bad{color:#f87171}
+#result-hash{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.85;margin-top:2px}#result-hash:empty{display:none}
+.tag.hash{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#94a3b8}

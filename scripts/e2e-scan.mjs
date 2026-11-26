@@ -98,6 +98,7 @@ try {
   await click(page, '#b-capture');
   await until(async () => (await text(page, '#s-count')) === '1', 'student added').catch(async (e) => { throw new Error(`${e.message} (hint: "${await text(page, '#enroll-hint')}", msg: "${await text(page, '#msg')}")`); });
   check((await text(page, '#s-list')).includes('Alice'), 'Alice enrolled (6 samples, strict quality gate, outliers pruned)');
+  check(/face #[0-9a-f]{8}/.test(await text(page, '#s-list')), 'roster shows the face template hash');
   check(await page.$eval('#s-list img', (i) => i.src.startsWith('data:image/jpeg')), 'thumbnail stored for the confirmation card');
 
   console.log('4. SPOOF: a still photo is not accepted while liveness is on');
@@ -115,6 +116,7 @@ try {
   await until(async () => (await present(page)) === '1', 'Alice marked');
   console.log(`  marked ${((Date.now() - t1) / 1000).toFixed(1)}s after liveness off`);
   check((await text(page, '#result-name')) === 'Alice' && (await page.$eval('#result-img', (i) => !i.hidden)), 'card shows name + photo');
+  check(/^scan #[0-9a-f]{8} → matched face template #[0-9a-f]{8}$/.test(await text(page, '#result-hash')), 'card shows scan + template hashes: "' + (await text(page, '#result-hash')) + '"');
   const dbg = await text(page, '#dbg-text');
   check(/fps/.test(dbg) && /dist/.test(dbg), 'debug overlay shows fps and distance: ' + dbg.split('\n')[0]);
   await click(page, '#result-undo');
