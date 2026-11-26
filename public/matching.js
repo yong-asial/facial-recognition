@@ -304,15 +304,18 @@ export class FaceTrack {
   }
 }
 
-/** Assigns detected faces to tracks by box overlap (greedy, best IoU first); unseen tracks expire. */
+/** Assigns detections to tracks by box overlap (greedy, best IoU first); unseen tracks expire.
+ *  Generic: faces by default, or anything with a box (PalmTrack in palm.js) through `create`.
+ *  @template {{box: Box, lastSeen: number}} [T=FaceTrack] */
 export class FaceTracker {
-  /** @param {{iouMin?: number, maxAgeMs?: number, track?: () => {window?: number, switchDist?: number, liveness?: LivenessTracker}}} [opts] */
-  constructor({ iouMin = 0.3, maxAgeMs = 1200, track = () => ({}) } = {}) {
-    this.iouMin = iouMin; this.maxAgeMs = maxAgeMs; this.trackOpts = track;
-    /** @type {FaceTrack[]} */ this.tracks = []; this.nextId = 1;
+  /** @param {{iouMin?: number, maxAgeMs?: number, track?: () => {window?: number, switchDist?: number, liveness?: LivenessTracker},
+   *   create?: (id: number, box: Box, now: number, opts: any) => T}} [opts] */
+  constructor({ iouMin = 0.3, maxAgeMs = 1200, track = () => ({}), create = (id, box, now, opts) => /** @type {any} */ (new FaceTrack(id, box, now, opts)) } = {}) {
+    this.iouMin = iouMin; this.maxAgeMs = maxAgeMs; this.trackOpts = track; this.create = create;
+    /** @type {T[]} */ this.tracks = []; this.nextId = 1;
   }
 
-  /** @template {{box: Box}} F @param {F[]} faces @param {number} now @returns {{face: F, track: FaceTrack}[]} */
+  /** @template {{box: Box}} F @param {F[]} faces @param {number} now @returns {{face: F, track: T}[]} */
   assign(faces, now) {
     this.tracks = this.tracks.filter((t) => now - t.lastSeen <= this.maxAgeMs);
     const cand = [];
@@ -321,12 +324,12 @@ export class FaceTracker {
       if (o >= this.iouMin) cand.push({ i, t, o });
     }
     cand.sort((a, b) => b.o - a.o);
-    /** @type {Map<number, FaceTrack>} */ const byFace = new Map();
+    /** @type {Map<number, T>} */ const byFace = new Map();
     const used = new Set();
     for (const { i, t } of cand) if (!byFace.has(i) && !used.has(t)) { byFace.set(i, t); used.add(t); }
     return faces.map((face, i) => {
       let track = byFace.get(i);
-      if (!track) this.tracks.push((track = new FaceTrack(this.nextId++, face.box, now, this.trackOpts())));
+      if (!track) this.tracks.push((track = this.create(this.nextId++, face.box, now, this.trackOpts())));
       track.box = face.box; track.lastSeen = now;
       return { face, track };
     });

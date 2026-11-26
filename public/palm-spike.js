@@ -1,13 +1,18 @@
 // Palm feasibility spike: live landmarks + ROI + code, labelled capture, and the genuine/impostor report that decides
 // whether training-free palmprint matching is good enough on this camera. Not part of the kiosk.
 import { PalmService } from './palm-service.js';
+import { FaceTracker } from './matching.js';
 import {
-  PalmMatcher, palmQuality, SCAN_PALM, ENROLL_PALM, palmReport, simulate1N, geometryDistance, hamming, codeToBase64, codeFromBase64,
+  PalmMatcher, PalmTrack, palmQuality, SCAN_PALM, ENROLL_PALM, palmReport, simulate1N, geometryDistance, hamming, codeToBase64, codeFromBase64,
   CODE_SIDE, PLANES, ORIENTATIONS, ROI_SIZE,
 } from './palm.js';
 
 const $ = (s) => document.querySelector(s);
 const KEY = 'palmSpike.samples';
+// Same tracking + fusion the kiosk will use: hands followed by box overlap, decision over 2-3 frames (fuseDecide).
+const tracker = new FaceTracker({ create: (id, box, now) => new PalmTrack(id, box, now) });
+const CONFIRM_FRAMES = 2, HOLD_MS = 2500;
+let shown = null; // last confirmed result, held on screen for HOLD_MS
 const BONES = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [0, 17], [17, 18], [18, 19], [19, 20]];
 const f2 = (v) => (Number.isFinite(v) ? v.toFixed(3) : '—');
 const pct = (v) => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '—');
@@ -18,7 +23,8 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 let saved = [];
 try { saved = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { saved = []; }
 let decoded = []; // saved + decoded Uint32Array code
-const redecode = () => { decoded = saved.map((s) => ({ ...s, code: codeFromBase64(s.code) })); };
+let people = []; // decoded, grouped by person: the live roster
+const redecode = () => { decoded = saved.map((s) => ({ ...s, code: codeFromBase64(s.code) })); people = groupPeople(decoded); tracker.clear(); };
 redecode();
 function persist() {
   try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) { $('#cap-state').textContent = 'Storage full — export and clear. ' + e.message; }
@@ -73,7 +79,7 @@ const hint = (t, kind = '') => { const h = $('#hint'); h.textContent = t; h.clas
 
 const tf = window.faceapi?.tf ?? null;
 const palm = new PalmService({ tf });
-window.palmSpike = { palm }; // console debugging
+window.palmSpike = { palm, tracker }; // console debugging
 $('#gpu').checked = !!tf; $('#gpu').disabled = !tf;
 $('#gpu').onchange = () => { palm.useGpu = $('#gpu').checked; };
 
@@ -133,20 +139,43 @@ function loop() {
     return { scanQ, capQ, ok: scanQ.ok, label: scanQ.ok ? `${f.hand} palm` : scanQ.hint };
   });
 
-  // Live 1:N on the biggest hand that passes the scan gate.
+  // Live 1:N, tracked and fused like the kiosk, on the biggest hand that passes the scan gate.
   const iBest = verdicts.findIndex((v) => v.scanQ.ok);
   current = iBest >= 0 ? frames[iBest] : frames[0] ?? null;
-  let matchHtml = decoded.length ? 'Show an open palm.' : 'No samples yet.';
-  if (iBest >= 0 && decoded.length) {
-    const tm = performance.now(), f = frames[iBest];
-    const people = groupPeople(decoded);
-    const scores = people.map((p) => ({ name: p.name, d: matcher.score(f, p) })).filter((s) => Number.isFinite(s.d)).sort((a, b) => a.d - b.d);
-    const m = matcher.match(f, people);
-    matchMs = performance.now() - tm;
-    verdicts[iBest].label = m.student ? m.student.name : m.reason === 'ambiguous' ? 'ambiguous' : 'unknown';
-    matchHtml = `<div class="${m.student ? 'ok' : 'bad'}"><strong>${m.student ? esc(m.student.name) : m.reason}</strong> d=${f2(m.distance)} runner-up=${f2(m.runnerUp)}</div>`
-      + scores.slice(0, 3).map((s) => `<div>${esc(s.name)} <span class="dim">${f2(s.d)}</span></div>`).join('');
+  const tNow = performance.now(), live = $('#live-mode').value;
+  const tm = performance.now();
+  const assigned = tracker.assign(frames, tNow);
+  let bestTrack = null, liveState = null;
+  assigned.forEach(({ face: f, track }, i) => {
+    const good = verdicts[i].scanQ.ok;
+    const l = track.observe(f, good && people.length > 0, tNow, matcher, people);
+    if (good) track.firstGood ??= tNow;
+    if (i === iBest) { bestTrack = track; liveState = l; }
+  });
+  matchMs = performance.now() - tm;
+  let matchHtml = people.length ? 'Show an open palm.' : 'No samples yet.';
+  if (bestTrack && people.length) {
+    const t = bestTrack, r = t.decide(matcher, { frames: CONFIRM_FRAMES, requireLiveness: live === 'flex' });
+    const latest = t.frames[t.frames.length - 1]?.scores ?? new Map();
+    const top = [...latest].sort((a, b) => a[1] - b[1]).slice(0, 3);
+    let state = r.match?.student ? `hold still… (${r.frames}/${CONFIRM_FRAMES})` : r.match?.reason ?? '';
+    if (r.waitingForLiveness) state = 'waiting for liveness: move your fingers a little';
+    if (r.match?.student && t.handled === r.match.student.id) state = 'checked in (once per hand in view)';
+    let confirmed = r.confirmed;
+    if (confirmed && live === 'grip') {
+      if (!t.liveness.gripPassed) { confirmed = false; if (!t.liveness.grip) t.liveness.startGrip(tNow); state = 'close your hand, then open it'; }
+    }
+    if (confirmed) {
+      t.handled = r.match.student.id;
+      shown = { name: r.match.student.name, ms: tNow - t.firstGood, at: tNow, d: r.match.distance };
+    }
+    verdicts[iBest].label = r.match?.student ? r.match.student.name : r.match?.reason === 'ambiguous' ? 'ambiguous' : 'unknown';
+    matchHtml = `<div class="${r.match?.student ? 'ok' : 'bad'}"><strong>${r.match?.student ? esc(r.match.student.name) : esc(r.match?.reason ?? '')}</strong>
+      fused d=${f2(r.match?.distance)} runner-up=${f2(r.match?.runnerUp)} <span class="dim">${esc(state)}</span></div>
+      <div class="dim">this frame: ${top.map(([st, d]) => `${esc(st.name)} ${f2(d)}`).join(', ')}</div>
+      <div class="dim">liveness: fingertip travel ${f2(liveState?.travel)} (pass ≥ ${t.liveness.flex}) ${t.liveness.passed ? '✓' : ''}${t.liveness.grip ? ' · grip: waiting' : t.liveness.gripPassed ? ' · grip ✓' : ''}</div>`;
   }
+  if (shown && tNow - shown.at < HOLD_MS) matchHtml = `<div class="ok" style="font-size:18px">✓ <strong>${esc(shown.name)}</strong> confirmed in ${shown.ms.toFixed(0)} ms <span class="dim">(first good frame → decision, d=${f2(shown.d)})</span></div>` + matchHtml;
   $('#match').innerHTML = matchHtml;
 
   // Capture.
@@ -230,17 +259,19 @@ $('#b-report').onclick = async () => {
     const metrics = { texture: (a, b) => tex[a.idx * n + b.idx], geometry: (a, b) => geo[a.idx * n + b.idx], [`fused (t + ${gw}·g)`]: (a, b) => tex[a.idx * n + b.idx] + gw * geo[a.idx * n + b.idx] };
     const reps = Object.entries(metrics).map(([name, fn]) => [name, palmReport(samples, fn, { crossSession })]);
     const fused = Object.assign(new PalmMatcher({ threshold: matcher.threshold, gap: matcher.gap, ratio: matcher.ratio, k: matcher.k }), { distance: metrics[Object.keys(metrics)[2]] });
-    const sim = simulate1N(samples, fused, { crossSession });
+    const nf = Number($('#frames').value) || 1;
+    const sim = simulate1N(samples, fused, { crossSession, frames: nf }), open = simulate1N(samples, fused, { frames: nf, openSet: true });
     const rows = [['genuine pairs', 'genuine'], ['impostor pairs', 'impostor'], ['genuine median', 'genuineMedian', f2], ['genuine p95', 'genuineP95', f2],
       ['impostor min', 'impostorMin', f2], ['impostor p1', 'impostorP01', f2], ['impostor median', 'impostorMedian', f2],
       ['EER', 'eer', pct], ['EER threshold', 'eerThr', f2], ['thr @ 0 false accepts', 'zeroFarThr', f2], ['genuine accept @ 0 FA', 'garAtZeroFar', pct]];
     $('#report').innerHTML = `<table><tr><th></th>${reps.map(([k]) => `<th>${esc(k)}</th>`).join('')}</tr>${rows.map(([label, key, fmt = (v) => v]) =>
       `<tr><td>${label}</td>${reps.map(([, r]) => `<td>${fmt(r[key])}</td>`).join('')}</tr>`).join('')}</table>
-      <p><strong>Kiosk replay</strong> (fused, threshold ${matcher.threshold.toFixed(3)}, single frame): ${sim.probes} scans →
+      <p><strong>Kiosk replay</strong> (threshold ${matcher.threshold.toFixed(3)}, ${nf} frame${nf > 1 ? 's, guarded vote' : ''}): ${sim.probes} scans →
       <span class="ok">${sim.correct} right (${pct(sim.correct / sim.probes)})</span>, <span class="warn">${sim.rejected} not recognised</span>,
-      <span class="${sim.wrong.length ? 'bad' : 'ok'}">${sim.wrong.length} WRONG person</span></p>
+      <span class="${sim.wrong.length ? 'bad' : 'ok'}">${sim.wrong.length} WRONG person</span>.
+      Unenrolled person: <span class="${open.wrong.length ? 'bad' : 'ok'}">${open.wrong.length} of ${open.probes} given a name</span></p>
       ${sim.wrong.slice(0, 5).map((w) => `<div class="bad">${esc(w.probe.person)} (${esc(w.probe.session)}) → ${esc(w.got)} d=${f2(w.distance)}</div>`).join('')}
-      <p class="dim">Go/no-go: wrong = 0 and ≥ 95% right after fusing 2–3 frames. A single frame here is the pessimistic case.</p>`;
+      <p class="dim">Go/no-go: wrong = 0, unenrolled = 0, and ≥ 95% right with 2–3 frames (consecutive captures of one burst stand in for video frames).</p>`;
     drawHist(reps[2][1]);
   } finally { btn.disabled = false; }
 };

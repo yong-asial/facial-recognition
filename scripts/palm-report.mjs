@@ -3,7 +3,8 @@
 //   node scripts/palm-report.mjs palm-samples.json --reencode         # recompute codes from the saved ROI JPEGs
 //   node scripts/palm-report.mjs palm-samples.json --sweep            # try several Gabor settings (implies --reencode)
 //   --wavelength 12 (with --reencode): one Gabor bank scaled to that wavelength
-//   options: --same-session (count same-session genuine pairs too)  --threshold 0.37  --geom 0.5  --shift 3
+//   --frames 2: also replay scans as 2 fused frames (PalmTrack's mean-score fusion)
+//   options: --same-session (count same-session genuine pairs too)  --threshold 0.38  --geom 0.5  --shift 3
 import fs from 'node:fs';
 import sharp from 'sharp';
 import {
@@ -17,7 +18,7 @@ const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number
 if (!file) { console.error('usage: node scripts/palm-report.mjs <export.json> [--reencode] [--sweep] [--same-session] [--threshold t] [--geom w] [--shift s]'); process.exit(1); }
 
 const raw = JSON.parse(fs.readFileSync(file, 'utf8')).samples;
-const crossSession = !flag('same-session'), threshold = num('threshold', 0.37), geomWeight = num('geom', 0), maxShift = num('shift', 3);
+const crossSession = !flag('same-session'), threshold = num('threshold', 0.38), frames = num('frames', 1), geomWeight = num('geom', 0), maxShift = num('shift', 3);
 const people = new Set(raw.map((s) => s.person)), sessions = new Set(raw.map((s) => s.session));
 console.log(`${raw.length} samples, ${people.size} people, ${sessions.size} sessions; genuine pairs: ${crossSession ? 'different sessions only' : 'all'}`);
 if (crossSession && sessions.size < 2) console.log('  (only one session: use --same-session, or capture a second day for the realistic number)');
@@ -45,15 +46,20 @@ function run(label, codes) {
   const d = (a, b) => tex[a.idx * n + b.idx] + geomWeight * geo[a.idx * n + b.idx];
   const r = palmReport(samples, d, { crossSession });
   const g = palmReport(samples, (a, b) => geo[a.idx * n + b.idx], { crossSession });
-  const sim = simulate1N(samples, Object.assign(new PalmMatcher({ threshold, maxShift }), { distance: d }), { crossSession });
+  const fused = Object.assign(new PalmMatcher({ threshold, maxShift }), { distance: d });
+  const sims = [...new Set([1, frames])].map((f) => [f, simulate1N(samples, fused, { crossSession, frames: f })]);
   console.log(`\n== ${label}`);
   console.log(`  pairs: ${r.genuine} genuine, ${r.impostor} impostor`);
   console.log(`  genuine  median ${f3(r.genuineMedian)}  p95 ${f3(r.genuineP95)}`);
   console.log(`  impostor min    ${f3(r.impostorMin)}  p1  ${f3(r.impostorP01)}  median ${f3(r.impostorMedian)}`);
   console.log(`  EER ${pct(r.eer)} at ${f3(r.eerThr)}   genuine accept at 0 false accepts: ${pct(r.garAtZeroFar)} (thr ${f3(r.zeroFarThr)})`);
   console.log(`  geometry alone: EER ${pct(g.eer)}, genuine accept at 0 FA ${pct(g.garAtZeroFar)}`);
-  console.log(`  kiosk replay @ ${threshold}: ${sim.probes} scans, ${sim.correct} right (${pct(sim.correct / sim.probes).trim()}), ${sim.rejected} not recognised, ${sim.wrong.length} WRONG`);
-  for (const w of sim.wrong.slice(0, 5)) console.log(`    WRONG ${w.probe.person} (${w.probe.session}) -> ${w.got} d=${f3(w.distance)}`);
+  const open = simulate1N(samples, fused, { frames, openSet: true });
+  for (const [f, sim] of sims) {
+    console.log(`  kiosk replay @ ${threshold}, ${f} frame${f > 1 ? 's fused' : ''}: ${sim.probes} scans, ${sim.correct} right (${pct(sim.correct / sim.probes).trim()}), ${sim.rejected} not recognised, ${sim.wrong.length} WRONG`);
+    for (const w of sim.wrong.slice(0, 5)) console.log(`    WRONG ${w.probe.person} (${w.probe.session}) -> ${w.got} d=${f3(w.distance)}`);
+  }
+  console.log(`  unenrolled person (open set), ${frames} frame(s): ${open.wrong.length} of ${open.probes} given a name`);
 }
 
 if (!grays) run(`stored codes (texture + ${geomWeight}·geometry, shift ±${maxShift})`, raw.map((s) => codeFromBase64(s.code)));

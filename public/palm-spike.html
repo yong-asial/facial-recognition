@@ -51,8 +51,9 @@
       <div class="grid2" id="live" style="margin-top:8px"></div>
     </section>
     <section>
-      <h2>Match (1:N against captured samples)</h2>
-      <div class="row"><label>Threshold <input type="range" id="thr" min="0.20" max="0.50" step="0.005" value="0.37"></label><strong id="thr-val"></strong></div>
+      <h2>Match (tracked + fused, like the kiosk)</h2>
+      <div class="row"><label>Threshold <input type="range" id="thr" min="0.20" max="0.50" step="0.005" value="0.38"></label><strong id="thr-val"></strong></div>
+      <div class="row"><label>Liveness <select id="live-mode"><option value="off">off</option><option value="flex">passive (finger movement)</option><option value="grip">grip (close + open)</option></select></label></div>
       <div id="match" class="dim">No samples yet.</div>
     </section>
     <section>
@@ -84,6 +85,7 @@
       <h2>Report</h2>
       <div class="row">
         <label><input type="checkbox" id="cross" checked> genuine = different sessions only</label>
+        <label>frames <select id="frames"><option>1</option><option selected>2</option><option>3</option></select></label>
         <label>geom weight <input type="number" id="gw" value="0" min="0" max="3" step="0.25" style="width:64px"></label>
         <button class="primary" id="b-report">Run</button>
       </div>

@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   LM, palmRoi, palmSide, palmFacing, palmFlatness, fingersOpen, palmQuality, SCAN_PALM, ENROLL_PALM, insideFrame, grayStats, toGray,
-  gaborBank, GABOR, filterResponses, encodeCompCode, hammingAt, hamming, handGeometry, geometryDistance, PalmMatcher, palmReport, simulate1N,
+  gaborBank, GABOR, filterResponses, encodeCompCode, hammingAt, hamming, handGeometry, geometryDistance, PalmMatcher, palmReport, simulate1N, fuseScores, fuseDecide, PalmTrack, PalmLiveness, palmFrameTips, prunePalmOutliers, palmDuplicate,
   codeToBase64, codeFromBase64, ROI_SIZE, CODE_SIDE, CODE_WORDS, ORIENTATIONS,
 } from '../public/palm.js';
+import { FaceTracker } from '../public/matching.js';
 
 const close = (a, b, e = 1e-6) => assert.ok(Math.abs(a - b) < e, `${a} !~ ${b}`);
 
@@ -221,4 +222,138 @@ test('simulate1N: kiosk replay counts right / wrong / rejected, cross-session ke
 test('code serialisation round-trips', () => {
   const c = codeOf(palmImage(3));
   assert.deepEqual(codeFromBase64(codeToBase64(c)), c);
+});
+
+// ---------- phase 1: fusion, tracking, liveness, enrolment ----------
+const A = { id: 1, name: 'A', palms: [sample(1), sample(1, 'Right', { noise: 10 })] };
+const B = { id: 2, name: 'B', palms: [sample(2), sample(2, 'Right', { noise: 10 })] };
+const roster = [A, B];
+const obs = (seed, { hand = 'Right', noise = 8, pts = rightPalm() } = {}) => ({ box: { x: 400, y: 250, width: 250, height: 350 }, pts, hand, roi: palmRoi(pts), code: codeOf(palmImage(seed, { noise })), geom: [] });
+
+test('fuseScores: per-student mean over frames; a student missing from any frame is dropped', () => {
+  const f = fuseScores([new Map([[A, 0.3], [B, 0.5]]), new Map([[A, 0.4]])]);
+  assert.equal(f.size, 1); close(f.get(A), 0.35);
+  assert.equal(fuseScores([]).size, 0);
+});
+
+test('PalmMatcher: match() = decide(scores()), students without that hand are not scored', () => {
+  const m = new PalmMatcher(), s = sample(1, 'Right', { noise: 6 });
+  const sc = m.scores(s, [...roster, { id: 3, name: 'LeftOnly', palms: [sample(5, 'Left')] }]);
+  assert.equal(sc.size, 2);
+  assert.deepEqual(m.decide(sc), m.match(s, roster));
+});
+
+test('PalmTrack: confirms after 2 fused frames, once per student', () => {
+  const m = new PalmMatcher(), t = new PalmTrack(1, obs(1).box, 0);
+  t.observe(obs(1, { noise: 9 }), true, 0, m, roster);
+  const one = t.decide(m, { fastDist: 0 }); // fast path off
+  assert.equal(one.match.student?.id, 1); assert.equal(one.confirmed, false, 'one frame is not enough');
+  t.observe(obs(1, { noise: 11 }), true, 30, m, roster);
+  const two = t.decide(m);
+  assert.equal(two.confirmed, true); assert.equal(two.frames, 2);
+  t.handled = 1;
+  assert.equal(t.decide(m).confirmed, false, 'not confirmed twice while the hand stays');
+});
+
+test('PalmTrack: a very close single frame takes the fast path; bad frames are not fused', () => {
+  const m = new PalmMatcher(), t = new PalmTrack(1, obs(1).box, 0);
+  t.observe(obs(1, { noise: 0 }), false, 0, m, roster);
+  assert.equal(t.decide(m).frames, 0);
+  t.observe(obs(1, { noise: 0 }), true, 0, m, roster);
+  const d = t.decide(m, { fastDist: 0.25 });
+  assert.ok(d.match.distance <= 0.25, `distance ${d.match.distance}`);
+  assert.equal(d.confirmed, true);
+});
+
+test('PalmTrack: starts over when the other hand or a different palm shows up in the same spot', () => {
+  const m = new PalmMatcher(), t = new PalmTrack(1, obs(1).box, 0);
+  t.observe(obs(1), true, 0, m, roster); t.observe(obs(1, { noise: 12 }), true, 30, m, roster);
+  assert.equal(t.frames.length, 2);
+  t.observe(obs(2), true, 60, m, roster);
+  assert.equal(t.frames.length, 1, 'different palm: reset');
+  const d = t.decide(m, { fastDist: 0 });
+  assert.equal(d.match.student?.id, 2, 'scored on B alone, not blended with the A frames');
+  assert.equal(d.confirmed, false, 'one frame is not enough');
+  t.observe(obs(2, { hand: 'Left', pts: mirrorX(rightPalm()) }), true, 90, m, roster);
+  assert.equal(t.frames.length, 1); assert.equal(t.hand, 'Left');
+  assert.equal(t.decide(m).match.reason, 'no-students', 'nobody has a left template');
+});
+
+test('PalmTrack: liveness gate when required', () => {
+  const m = new PalmMatcher(), t = new PalmTrack(1, obs(1).box, 0);
+  for (let i = 0; i < 3; i++) t.observe(obs(1, { noise: 8 + i }), true, i * 30, m, roster);
+  const d = t.decide(m, { requireLiveness: true });
+  assert.equal(d.confirmed, false); assert.equal(d.waitingForLiveness, true);
+});
+
+test('FaceTracker is generic: follows hands as PalmTracks by box overlap', () => {
+  const tr = new FaceTracker({ create: (id, box, now) => new PalmTrack(id, box, now) });
+  const a = tr.assign([{ box: { x: 0, y: 0, width: 100, height: 100 } }], 0)[0].track;
+  const b = tr.assign([{ box: { x: 5, y: 5, width: 100, height: 100 } }], 30)[0].track;
+  assert.ok(a instanceof PalmTrack); assert.equal(a, b);
+  const c = tr.assign([{ box: { x: 500, y: 500, width: 100, height: 100 } }], 60)[0].track;
+  assert.notEqual(c, a);
+});
+
+/** Rigid move of the whole hand (what a waved photo does): rotate, scale and shift every landmark together. */
+const rigid = (pts, a, k, dx) => pts.map((p) => ({ x: 500 + ((p.x - 500) * Math.cos(a) - (p.y - 600) * Math.sin(a)) * k + dx, y: 600 + ((p.x - 500) * Math.sin(a) + (p.y - 600) * Math.cos(a)) * k, z: 0 }));
+
+test('PalmLiveness: a rigid (photo-like) hand never passes; flexing fingers passes', () => {
+  const photo = new PalmLiveness();
+  for (let i = 0; i < 30; i++) { const p = rigid(rightPalm(), Math.sin(i / 3) * 0.4, 1 + 0.2 * Math.sin(i / 5), 40 * Math.sin(i / 4)); photo.observe(p, palmRoi(p), 'Right', i * 33); }
+  assert.equal(photo.passed, false, `travel ${photo.travel}`);
+  const live = new PalmLiveness();
+  for (let i = 0; i < 30; i++) {
+    const p = rightPalm().map((q, j) => ([8, 12].includes(j) ? { ...q, x: q.x + 18 * Math.sin(i / 4) } : q));
+    live.observe(p, palmRoi(p), 'Right', i * 33);
+  }
+  assert.equal(live.passed, true, `travel ${live.travel}`);
+  const tips = palmFrameTips(rightPalm(), palmRoi(rightPalm())), tips2 = palmFrameTips(rigid(rightPalm(), 0.5, 1.4, 90), palmRoi(rigid(rightPalm(), 0.5, 1.4, 90)));
+  tips.forEach((t, i) => { close(t.x, tips2[i].x, 1e-9); close(t.y, tips2[i].y, 1e-9); });
+});
+
+test('PalmLiveness: grip challenge = close then open within the time limit', () => {
+  const l = new PalmLiveness({ gripTimeoutMs: 1000 }), open = rightPalm(), fist = rightPalm({ curl: true });
+  l.startGrip(0);
+  assert.equal(l.observe(open, palmRoi(open), 'Right', 10).grip, 'pending', 'open hand alone does not pass');
+  l.observe(fist, palmRoi(fist), 'Right', 300);
+  assert.equal(l.observe(open, palmRoi(open), 'Right', 600).grip, 'passed');
+  assert.equal(l.gripPassed, true);
+  l.startGrip(1000);
+  assert.equal(l.observe(open, palmRoi(open), 'Right', 2100).grip, 'failed', 'timed out');
+});
+
+test('prunePalmOutliers / palmDuplicate: enrolment drops the odd sample and spots an already-enrolled palm', () => {
+  const m = new PalmMatcher();
+  const samples = [sample(1, 'Right', { noise: 4 }), sample(1, 'Right', { noise: 8 }), sample(1, 'Right', { noise: 12 }), sample(1, 'Right', { noise: 6, shift: 1 }), sample(42)];
+  const kept = prunePalmOutliers(samples, m, { keep: 3 });
+  assert.equal(kept.length, 4); assert.ok(!kept.includes(samples[4]));
+  assert.equal(palmDuplicate(kept, roster, m)?.student.id, 1);
+  assert.equal(palmDuplicate([sample(77)], roster, m), null);
+});
+
+test('simulate1N: fusing frames per probe', () => {
+  const samples = [];
+  for (const person of [1, 2, 3]) for (const [session, noises] of [['d1', [6, 8]], ['d2', [10, 12, 14, 16]]])
+    for (const noise of noises) samples.push({ person: String(person), hand: 'Right', session, code: codeOf(palmImage(person, { noise })), geom: [] });
+  const r = simulate1N(samples, new PalmMatcher(), { crossSession: true, frames: 2 });
+  assert.equal(r.probes, 3 * (1 + 2)); // d1: one pair, d2: two pairs
+  assert.equal(r.correct, r.probes); assert.equal(r.wrong.length, 0);
+});
+
+test('fuseDecide: guarded vote over frames', () => {
+  const m = new PalmMatcher({ threshold: 0.38 });
+  const f = (a, b) => new Map([[A, a], [B, b]]);
+  assert.equal(fuseDecide(m, [f(0.30, 0.46), f(0.40, 0.47)]).student, A, 'one confident frame, the other near: ok');
+  assert.equal(fuseDecide(m, [f(0.30, 0.46), f(0.47, 0.30)]).reason, 'ambiguous', 'frames confident about different students');
+  assert.equal(fuseDecide(m, [f(0.33, 0.47), f(0.48, 0.49), f(0.48, 0.49)]).student, null, 'one lucky frame among far ones');
+  assert.equal(fuseDecide(m, [f(0.41, 0.47), f(0.42, 0.47)]).reason, 'too-far', 'no frame confident on its own');
+  assert.equal(fuseDecide(m, []).reason, 'no-students');
+});
+
+test('simulate1N openSet: an unenrolled person is never given a name', () => {
+  const samples = [];
+  for (const person of [1, 2, 3, 4]) for (const noise of [6, 9, 12]) samples.push({ person: String(person), hand: 'Right', session: 'd1', code: codeOf(palmImage(person, { noise })), geom: [] });
+  const r = simulate1N(samples, new PalmMatcher(), { openSet: true });
+  assert.equal(r.probes, 12); assert.equal(r.correct, 0); assert.equal(r.wrong.length, 0); assert.equal(r.rejected, 12);
 });

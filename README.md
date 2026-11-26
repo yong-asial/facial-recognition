@@ -7,7 +7,7 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (80)
+npm test             # unit + API tests (93)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
 ```
 
@@ -120,7 +120,7 @@ The kiosk integration waits on the go/no-go below, because contactless palmprint
 ```bash
 npm run models       # once: downloads MediaPipe hand_landmarker.task (~7.5 MB) into ./models (gitignored)
 npm start            # then open http://localhost:3009/palm-spike.html (no login)
-npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.37] [--wavelength 14] [--geom 0.5]
+npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.38] [--wavelength 14] [--frames 3] [--geom 0.5]
 node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--per 8] [--webcam]   # public dataset run, see below
 ```
 
@@ -130,7 +130,10 @@ node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--p
 | Palm ROI | `palmRoi` | 128 px square below the knuckle line (index MCP 5 to pinky MCP 17), rotated upright, never mirrored. ~3 ms canvas warp |
 | Quality gate | `palmQuality` | palm (not the back of the hand) facing, fingers open, flat to the camera, size, light, blur. Lenient `SCAN_PALM`, strict `ENROLL_PALM` |
 | Texture code | `encodeCompCode` | Competitive Code: 6 oriented Gabor filters, winning orientation per point on a 32×32 grid (3 bits) + a mask for low-contrast points. One `tf.conv2d` on face-api's TensorFlow.js: **1.2 ms GPU** (4.6 ms in plain JS, identical code) |
-| Match | `PalmMatcher` | shift-tolerant (±3 cells) Hamming distance, same accept rules as faces (threshold, gap, ratio, mean of 2 nearest); same-hand templates only. Optional hand-geometry term (`geomWeight`, off until data shows it helps) |
+| Match | `PalmMatcher` | shift-tolerant (±3 cells) Hamming distance, same accept rules as faces (threshold 0.38, gap, ratio, mean of 2 nearest); same-hand templates only. Hand-geometry term exists but is off (useless, see below) |
+| Track + fuse | `FaceTracker` (now generic) + `PalmTrack`, `fuseDecide` | each hand followed by box overlap; per-frame scores computed once; decision over 2–3 frames by **guarded vote**: one frame passes the rules on its own, no frame names someone else, and the mean score agrees (within 0.03 of the threshold). A different palm or the other hand in the same spot restarts the track |
+| Liveness | `PalmLiveness` | passive: fingertips must move in the palm's own frame (a photo is rigid, however it is waved); active: "close then open your hand". **Thresholds untuned**: on a still photo, landmark jitter alone reads 0.03–0.04 against a 0.06 pass line |
+| Enrolment helpers | `prunePalmOutliers`, `palmDuplicate` | drop samples far from the medoid; warn when the palm is already enrolled under another student |
 
 **Public-dataset run (2026-11-26).** [11K Hands](https://sites.google.com/view/11khands) (Afifi 2019, academic use; not committed) palm photos, 60 people, 8 photos per hand, each person's photos split into an "enrol" half and a "scan" half. `--webcam` shrinks each photo to 640×480 and recompresses it at JPEG quality 70.
 
@@ -142,6 +145,8 @@ node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--p
 | EER (λ=14) | 4.1% | 2.7% |
 | kiosk replay, one photo, threshold just under the closest impostor | 92.2% right, 0 wrong | 92.2% right, 0 wrong (at 0.37: 89.5%) |
 | hand geometry alone | EER 30% (useless; kept at weight 0) | EER 30% |
+
+Frame fusion (webcam-like, threshold 0.38, enrol/scan halves): 1 frame **92.2%** right · 2 frames **95.1%** · 3 frames **98.6%**, always 0 wrong; an unenrolled person was given a name 0 of 140 (2 frames) / 0 of 75 (3 frames) times, and 0 of 296 single frames even at threshold 0.40. Guarded vote beat a plain mean (95.7% at 3 frames) and best-frame-only (97.1%) with the same 0 errors. `npm run palm:report -- export.json --frames 3` reproduces it.
 
 Wavelength sweep (EER, webcam-like): λ=10 4.1%, 12 ~3.5%, **14 2.7%**, 16 2.7% (but fewer right at a safe threshold), 18 2.7%. Coarser filters follow principal lines, which stay put when the hand pose changes; fine wrinkles move. Resolution is not the limit (640×480 ≈ full res); ROI alignment between poses is.
 Caveats: each person's photos come from one sitting (no day-to-day change; optimistic), but every photo is an independent pose with no tracking (pessimistic). The margin is thin: the closest different-person pair is only ~0.02 above the threshold.

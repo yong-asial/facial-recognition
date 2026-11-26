@@ -271,8 +271,9 @@ export class PalmMatcher {
   /** Same accept rules as MatchingService: threshold, absolute gap AND ratio to the runner-up, mean of k nearest samples.
    *  Distance = texture Hamming (0..1) + geomWeight * geometry distance. geomWeight 0 until the spike shows geometry helps.
    *  @param {{threshold?: number, gap?: number, ratio?: number, k?: number, geomWeight?: number, maxShift?: number}} [opts] */
-  // threshold 0.37 / maxShift 3: just under the closest different-person pair on 11K Hands at wavelength 14 (0.381-0.389).
-  constructor({ threshold = 0.37, gap = 0.03, ratio = 0.9, k = 2, geomWeight = 0, maxShift = 3 } = {}) {
+  // threshold 0.38 / maxShift 3, from 11K Hands at wavelength 14: the closest different-person pair is 0.381-0.389, but the
+  // gap + ratio rules keep it safe: 0 wrong and 0 of 296 unenrolled scans accepted even at 0.40.
+  constructor({ threshold = 0.38, gap = 0.03, ratio = 0.9, k = 2, geomWeight = 0, maxShift = 3 } = {}) {
     this.threshold = threshold; this.gap = gap; this.ratio = ratio; this.k = k; this.geomWeight = geomWeight; this.maxShift = maxShift;
   }
 
@@ -288,13 +289,20 @@ export class PalmMatcher {
     return ds.length ? ds.reduce((x, d) => x + d, 0) / ds.length : Infinity;
   }
 
-  /** @param {PalmSample} s @param {PalmEnrolled[]} students @returns {PalmMatch} */
-  match(s, students) {
+  /** Every student's score for one sample (students without a template of that hand are left out).
+   *  @param {PalmSample} s @param {PalmEnrolled[]} students @returns {Map<PalmEnrolled, number>} */
+  scores(s, students) {
+    const out = new Map();
+    for (const st of students) { const d = this.score(s, st); if (Number.isFinite(d)) out.set(st, d); }
+    return out;
+  }
+
+  /** Accept rules on a set of scores: favours "not recognised, ask the teacher" over a wrong name.
+   *  @param {Map<PalmEnrolled, number>} scores @returns {PalmMatch} */
+  decide(scores) {
     /** @type {{student: PalmEnrolled, d: number} | null} */ let best = null;
     let runnerUp = Infinity;
-    for (const student of students) {
-      const d = this.score(s, student);
-      if (!Number.isFinite(d)) continue;
+    for (const [student, d] of scores) {
       if (!best || d < best.d) { if (best) runnerUp = Math.min(runnerUp, best.d); best = { student, d }; }
       else runnerUp = Math.min(runnerUp, d);
     }
@@ -303,6 +311,169 @@ export class PalmMatcher {
     if (runnerUp - best.d < this.gap || best.d / runnerUp > this.ratio) return { student: null, distance: best.d, runnerUp, reason: 'ambiguous' };
     return { student: best.student, distance: best.d, runnerUp, reason: 'ok' };
   }
+
+  /** @param {PalmSample} s @param {PalmEnrolled[]} students @returns {PalmMatch} */
+  match(s, students) { return this.decide(this.scores(s, students)); }
+}
+
+/** Temporal fusion at score level: a student's fused score is the mean of their scores over the frames.
+ *  Codes are not averaged (bits can't be, and frames are a few pixels apart, which the shift search absorbs per frame).
+ *  Only students scored in every frame are kept, so one lucky frame can't make a candidate.
+ *  @param {Map<PalmEnrolled, number>[]} frames @returns {Map<PalmEnrolled, number>} */
+export function fuseScores(frames) {
+  /** @type {Map<PalmEnrolled, number>} */ const out = new Map();
+  if (!frames.length) return out;
+  for (const [st] of frames[0]) {
+    let sum = 0, ok = true;
+    for (const f of frames) { const d = f.get(st); if (d === undefined) { ok = false; break; } sum += d; }
+    if (ok) out.set(st, sum / frames.length);
+  }
+  return out;
+}
+
+/** The kiosk's multi-frame decision ("guarded vote"), measured best on 11K Hands (3 frames: 98.6% right vs 95.7% for the
+ *  plain mean, 0 wrong, 0 unenrolled people accepted):
+ *  - at least one frame must pass the accept rules on its own,
+ *  - no frame may pass them for a different student,
+ *  - and the student must also be best on the fused (mean) score, within `guard` of the threshold, so one lucky frame
+ *    among clearly-far ones does not decide.
+ *  @param {PalmMatcher} matcher @param {Map<PalmEnrolled, number>[]} frames @returns {PalmMatch} */
+export function fuseDecide(matcher, frames, { guard = 0.03 } = {}) {
+  const fused = matcher.decide(fuseScores(frames));
+  const voted = frames.map((f) => matcher.decide(f)).filter((d) => d.student);
+  if (!voted.length) return fused.student ? { ...fused, student: null, reason: 'too-far' } : fused;
+  const who = voted[0].student;
+  if (voted.some((d) => d.student !== who)) return { ...fused, student: null, reason: 'ambiguous' };
+  const scores = fuseScores(frames), d = scores.get(/** @type {PalmEnrolled} */ (who)) ?? Infinity;
+  let runnerUp = Infinity;
+  for (const [st, v] of scores) if (st !== who) runnerUp = Math.min(runnerUp, v);
+  if (d > matcher.threshold + guard || runnerUp < d) return { student: null, distance: d, runnerUp, reason: 'too-far' };
+  return { student: who, distance: d, runnerUp, reason: 'ok' };
+}
+
+// ---------- tracking: one hand across frames ----------
+/** @typedef {{box: {x: number, y: number, width: number, height: number}, pts: Pt[], hand: Hand, roi: Roi, code: Uint32Array, geom: number[]}} PalmObservation */
+
+/** One hand followed across frames (assigned by box overlap with FaceTracker from matching.js, which is generic).
+ *  Keeps the per-frame scores of its last `window` good frames and decides with fuseDecide (guarded vote).
+ *  Scores are computed once per frame when it arrives, so a decision costs one 1:N match per frame, not per window. */
+export class PalmTrack {
+  /** @param {number} id @param {{x: number, y: number, width: number, height: number}} box @param {number} now
+   *  @param {{window?: number, switchDist?: number, liveness?: PalmLiveness}} [opts] */
+  constructor(id, box, now, { window = 3, switchDist = 0.42, liveness = new PalmLiveness() } = {}) {
+    this.id = id; this.box = box; this.lastSeen = now; this.window = window; this.switchDist = switchDist; this.liveness = liveness;
+    /** @type {{sample: PalmSample, scores: Map<PalmEnrolled, number>}[]} */ this.frames = [];
+    /** @type {Hand | null} */ this.hand = null;
+    /** @type {number | null} student already handled on this track */ this.handled = null;
+  }
+
+  reset() { this.frames = []; this.hand = null; this.handled = null; this.liveness.reset(); }
+
+  /** @param {PalmObservation} obs @param {boolean} good passed the scan gate @param {number} now
+   *  @param {PalmMatcher} matcher @param {PalmEnrolled[]} students */
+  observe(obs, good, now, matcher, students) {
+    if (good) {
+      const last = this.frames[this.frames.length - 1]?.sample;
+      // The other hand, or a different palm in the same spot (consecutive frames of one palm are ~0.1-0.25 apart): start over.
+      if (last && (obs.hand !== last.hand || hamming(obs.code, last.code, matcher.maxShift) > this.switchDist)) this.reset();
+      const sample = { hand: obs.hand, code: obs.code, geom: obs.geom };
+      this.frames.push({ sample, scores: matcher.scores(sample, students) });
+      if (this.frames.length > this.window) this.frames.shift();
+      this.hand = obs.hand;
+    }
+    return this.liveness.observe(obs.pts, obs.roi, obs.hand, now);
+  }
+
+  /** Same contract as FaceTrack.decide. frames: good frames needed (2 = ~70 ms at 30 fps); a very close match may decide on fastFrames.
+   *  @param {PalmMatcher} matcher
+   *  @param {{frames?: number, fastFrames?: number, fastDist?: number, requireLiveness?: boolean}} [opts] */
+  decide(matcher, { frames = 2, fastFrames = 1, fastDist = 0.25, requireLiveness = false } = {}) {
+    const n = this.frames.length;
+    if (!n) return { match: null, confirmed: false, waitingForLiveness: false, frames: 0 };
+    const match = fuseDecide(matcher, this.frames.map((f) => f.scores));
+    const enough = n >= frames || (n >= fastFrames && match.reason === 'ok' && match.distance <= fastDist);
+    const ready = enough && match.reason === 'ok' && match.student?.id !== this.handled;
+    const live = !requireLiveness || this.liveness.passed;
+    return { match, confirmed: ready && live, waitingForLiveness: ready && !live, frames: n };
+  }
+}
+
+// ---------- liveness ----------
+/** Fingertip positions in the palm's own frame (ROI axes, in palm widths): invariant to moving, turning or zooming the hand.
+ *  @param {Pt[]} pts @param {Roi} roi */
+export function palmFrameTips(pts, roi) {
+  return [4, 8, 12, 16, 20].map((i) => {
+    const d = sub(pts[i], roi.center);
+    return { x: dot(d, roi.u) / roi.side, y: dot(d, roi.n) / roi.side };
+  });
+}
+
+/** Passive check: a live hand flexes - fingertips move relative to the palm frame - while a printed or on-screen palm is
+ *  rigid, so its fingertips stay put in that frame however it is waved around. Also offers an active "close then open
+ *  your hand" check (grip), which a photo can't do at all. Thresholds are first guesses: tune with the spike's readout.
+ *  NOTE: like the face check, this stops a held-up photo, not a replayed video. */
+export class PalmLiveness {
+  /** @param {{windowMs?: number, flex?: number, gripTimeoutMs?: number}} [opts]
+   *  flex: fingertip travel (max over the 5 tips, in palm widths) within the window that counts as a live hand. */
+  constructor({ windowMs = 2000, flex = 0.06, gripTimeoutMs = 4000 } = {}) {
+    this.windowMs = windowMs; this.flex = flex; this.gripTimeoutMs = gripTimeoutMs;
+    /** @type {{t: number, tips: {x: number, y: number}[]}[]} */ this.samples = [];
+    this.passed = false; this.travel = 0;
+    /** @type {null | {startedAt: number, closed: boolean}} */ this.grip = null;
+    this.gripPassed = false;
+  }
+
+  reset() { this.samples = []; this.passed = false; this.travel = 0; this.grip = null; this.gripPassed = false; }
+
+  /** Ask for "close your hand, then open it". @param {number} now */
+  startGrip(now) { this.grip = { startedAt: now, closed: false }; this.gripPassed = false; }
+
+  /** @param {Pt[]} pts @param {Roi} roi @param {Hand} _hand @param {number} now */
+  observe(pts, roi, _hand, now) {
+    this.samples.push({ t: now, tips: palmFrameTips(pts, roi) });
+    while (this.samples.length && now - this.samples[0].t > this.windowMs) this.samples.shift();
+    let travel = 0;
+    for (let i = 0; i < 5; i++) {
+      const xs = this.samples.map((s) => s.tips[i].x), ys = this.samples.map((s) => s.tips[i].y);
+      travel = Math.max(travel, Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)));
+    }
+    this.travel = travel;
+    if (travel >= this.flex) this.passed = true;
+    /** @type {'none' | 'pending' | 'passed' | 'failed'} */ let grip = 'none';
+    if (this.grip) {
+      const open = fingersOpen(pts);
+      if (!this.grip.closed && open <= 1) this.grip.closed = true;
+      if (this.grip.closed && open >= 3) { this.gripPassed = true; this.grip = null; grip = 'passed'; }
+      else if (now - this.grip.startedAt > this.gripTimeoutMs) { this.grip = null; grip = 'failed'; }
+      else grip = 'pending';
+    }
+    return { passed: this.passed, travel, grip, gripPassed: this.gripPassed };
+  }
+}
+
+// ---------- enrolment ----------
+/** Drop enrolment samples far from the others (a half-closed hand, motion blur, a misplaced ROI). Distances from the medoid
+ *  (the sample closest to all others), like pruneOutliers() for faces. Keeps at least `keep`, the most central ones.
+ *  @template {PalmSample} S @param {S[]} samples @param {PalmMatcher} matcher */
+export function prunePalmOutliers(samples, matcher, { maxDist = 0.4, keep = 3 } = {}) {
+  if (samples.length <= keep) return samples.slice();
+  const d = samples.map((a) => samples.map((b) => (a === b ? 0 : matcher.distance(a, b))));
+  const total = d.map((row) => row.reduce((x, y) => x + y, 0));
+  const m = total.indexOf(Math.min(...total));
+  const ranked = samples.map((s, i) => ({ s, d: d[m][i] })).sort((a, b) => a.d - b.d);
+  return ranked.filter((r, i) => i < keep || r.d <= maxDist).map((r) => r.s);
+}
+
+/** Is this palm already enrolled under another student? (Two templates for one palm = wrong marks.)
+ *  Returns the closest other student whose score is within the accept threshold, or null.
+ *  @param {PalmSample[]} samples new enrolment (one hand) @param {PalmEnrolled[]} others @param {PalmMatcher} matcher */
+export function palmDuplicate(samples, others, matcher) {
+  let best = null;
+  for (const st of others) {
+    const d = Math.min(...samples.map((s) => matcher.score(s, st)));
+    if (Number.isFinite(d) && d <= matcher.threshold && (!best || d < best.d)) best = { student: st, d };
+  }
+  return best;
 }
 
 // ---------- evaluation (feasibility spike) ----------
@@ -341,26 +512,34 @@ export function palmReport(samples, metric, { crossSession = false } = {}) {
   };
 }
 
-/** Kiosk simulation: every sample is a scan, matched 1:N against everyone's other samples with the real accept rules.
+/** Kiosk simulation: each probe is a scan, matched 1:N against everyone's other samples with the real accept rules.
+ *  frames > 1: a probe is `frames` consecutive samples of one person/hand/session, decided like PalmTrack (fuseDecide).
+ *  openSet: the probe's own person is removed from the roster (an unenrolled student walks up): any name is wrong.
  *  crossSession: the scanned person's templates come only from their other sessions (enrol one day, scan another);
  *  probes whose person has no other session are skipped. What matters for a kiosk: `wrong` must be 0.
  *  @param {LabelledSample[]} samples @param {PalmMatcher} matcher */
-export function simulate1N(samples, matcher, { crossSession = false } = {}) {
+export function simulate1N(samples, matcher, { crossSession = false, frames = 1, openSet = false } = {}) {
   let probes = 0, correct = 0, rejected = 0;
   /** @type {{probe: LabelledSample, got: string, distance: number}[]} */ const wrong = [];
-  for (const s of samples) {
-    /** @type {Map<string, PalmEnrolled>} */ const gallery = new Map();
-    for (const g of samples) {
-      if (g === s || (crossSession && g.person === s.person && g.session === s.session)) continue;
-      if (!gallery.has(g.person)) gallery.set(g.person, { id: gallery.size, name: g.person, palms: [] });
-      gallery.get(g.person)?.palms.push(g);
+  /** @type {Map<string, LabelledSample[]>} */ const runs = new Map();
+  for (const s of samples) { const k = `${s.person}|${s.hand}|${s.session}`; if (!runs.has(k)) runs.set(k, []); runs.get(k)?.push(s); }
+  for (const run of runs.values()) {
+    for (let i = 0; i + frames <= run.length; i += frames) {
+      const probe = run.slice(i, i + frames), p0 = probe[0], inProbe = new Set(probe);
+      /** @type {Map<string, PalmEnrolled>} */ const gallery = new Map();
+      for (const g of samples) {
+        if (inProbe.has(g) || (crossSession && g.person === p0.person && g.session === p0.session) || (openSet && g.person === p0.person)) continue;
+        if (!gallery.has(g.person)) gallery.set(g.person, { id: gallery.size, name: g.person, palms: [] });
+        gallery.get(g.person)?.palms.push(g);
+      }
+      if (!openSet && !gallery.get(p0.person)?.palms.some((p) => p.hand === p0.hand)) continue;
+      probes++;
+      const students = [...gallery.values()];
+      const m = fuseDecide(matcher, probe.map((s) => matcher.scores(s, students)));
+      if (!m.student) rejected++;
+      else if (m.student.name === p0.person) correct++;
+      else wrong.push({ probe: p0, got: m.student.name, distance: m.distance });
     }
-    if (!gallery.get(s.person)?.palms.some((p) => p.hand === s.hand)) continue;
-    probes++;
-    const m = matcher.match(s, [...gallery.values()]);
-    if (!m.student) rejected++;
-    else if (m.student.name === s.person) correct++;
-    else wrong.push({ probe: s, got: m.student.name, distance: m.distance });
   }
   return { probes, correct, rejected, wrong };
 }
