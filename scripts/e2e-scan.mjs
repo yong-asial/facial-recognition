@@ -57,6 +57,11 @@ const startSession = async (page, name) => {
   await until(() => visible(page, '#scan-main'), 'scan screen after starting session');
 };
 
+// #sv-end has no hidden attribute of its own while its parent view is still hidden and loading, so waiting for it alone
+// passes at once and the click lands before viewSession() has set `viewing` (the app then ignores it). Wait for the
+// view itself to be shown with a live session.
+const sessionLoaded = (page) => until(async () => (await visible(page, '#sess-view')) && (await visible(page, '#sv-end')) && /live/.test(await text(page, '#sv-sub')), 'live session view');
+
 let browser;
 try {
   const t0 = Date.now();
@@ -152,7 +157,7 @@ try {
   if (process.env.E2E_SHOTS) await page.$('#scan-box').then((e) => e.screenshot({ path: `${process.env.E2E_SHOTS}/recognised.png` }));
   await click(page, '#b-kiosk');
   await click(page, '#tabs [data-tab=session]');
-  await until(() => visible(page, '#sv-end'), 'end button');
+  await sessionLoaded(page);
   await page.evaluate(() => { window.confirm = () => true; }); // CDP dialog handling is also unreliable with the fake camera
   await click(page, '#sv-end');
   await until(() => visible(page, '#sess-start'), 'ended');
@@ -170,7 +175,7 @@ try {
   check(await page.$eval('#face-canvas', (c) => { const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; return !d.some((v) => v); }), 'face box can be switched off');
   await click(page, '#b-kiosk');
   await click(page, '#tabs [data-tab=session]');
-  await until(() => visible(page, '#sv-end'), 'end button');
+  await sessionLoaded(page);
   await click(page, '#sv-end');
   await until(() => visible(page, '#sess-start'), 'ended');
   await browser.close();
