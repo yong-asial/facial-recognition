@@ -7,8 +7,9 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (100)
+npm test             # unit + API tests (101)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
+node scripts/e2e-palm.mjs palmA.y4m [palmB.y4m]   # palm kiosk E2E (see "Palm scanning")
 ```
 
 Node 22.5+. The camera needs **HTTPS or localhost**: an iPad opening `http://<laptop-ip>:3009` is blocked from the camera, so use a tunnel/HTTPS for iPad.
@@ -103,6 +104,7 @@ Turn on cue: the direction is random and judged against where the head started; 
 - [ ] **Orientation**: rotate the iPad portrait/landscape; the front/rear camera switch works.
 - [ ] **Camera permission denied** shows a clear message; model files missing shows "Could not load face models".
 - [ ] **Delete face data** then scan that student: not recognised, manual works.
+- [ ] **Palm**: enrol right palms (strict gate passes within ~10 s at 30 cm?), scan with *Scan with: Palm*: time to "Present", the back of the hand is refused, the left hand gets "Use your right hand", two hands at once, a printed palm photo with *Finger movement* liveness (must NOT pass), the close & open challenge (does the track survive the fist?), gloves / plasters / wet hands.
 
 ## E2E fixtures
 ```bash
@@ -114,9 +116,12 @@ ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/C.jpg -vf "$V" -pix_fmt yuv4
 ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/A.jpg -vf "$V,perspective=x0=0:y0='0.13*H*sin(2*PI*on/12)':x1=W:y1='-0.13*H*sin(2*PI*on/12)':x2=0:y2='H-0.13*H*sin(2*PI*on/12)':x3=W:y3='H+0.13*H*sin(2*PI*on/12)':eval=frame:sense=destination" -pix_fmt yuv420p /tmp/e2e/camLive.y4m
 ```
 
-## Palm scanning (backend ready, kiosk UI next)
-Goal: check-in by showing an open palm to the same camera, faster than face (target < 1 s from palm in view to "Present").
-The kiosk integration waits on the go/no-go below, because contactless palmprint on a webcam/iPad camera is far less accurate than published numbers (lab lighting, contact scanners).
+## Palm scanning
+Check-in by showing an open palm to the same camera (target < 1 s from palm in view to "Present").
+- **Kiosk:** Scan sidebar -> **Scan with: Palm** (saved per browser; one method at a time, so only one model runs per frame). Same card, cooldown, *Wrong person*, manual picker and offline queue as faces; attendance is recorded with method `palm`. Hints: "Show the palm of your hand", "Open your hand, fingers apart", "Use your right hand" (when nobody enrolled the hand shown), "Move your fingers a little" (liveness).
+- **Liveness (same menu, palm wording):** *Finger movement* (passive: fingertips must move relative to the palm; a held photo is rigid), *+ random close & open spot checks*, *Close & open hand for every student*, *Off*. Passive thresholds are first guesses: tune them with real hands and printed palms (debug overlay shows `finger travel`).
+- **Enrolment:** Students -> *Capture palm & add student* (or *Enrol / Re-enrol palm* on a roster row), right hand by default, left or both from the menu. 6 frames per hand through the strict gate, outliers dropped, duplicate warning. A student can have face, palm or both; *Delete palm data* withdraws palms only.
+Contactless palmprint on a webcam/iPad camera is less accurate than published numbers (lab lighting, contact scanners): check the go/no-go below with real people before relying on it.
 
 ```bash
 npm run models       # once: downloads MediaPipe hand_landmarker.task (~7.5 MB) into ./models (gitignored)

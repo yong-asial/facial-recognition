@@ -67,7 +67,12 @@
           <button id="b-flip">Switch camera</button>
           <button id="b-kiosk" class="primary">Pause</button>
           <div class="opts">
-            <label class="check"><input type="checkbox" id="opt-box" checked> Show face box</label>
+            <label>Scan with
+              <select id="opt-method">
+                <option value="face" selected>Face</option>
+                <option value="palm">Palm (show an open hand)</option>
+              </select></label>
+            <label class="check"><input type="checkbox" id="opt-box" checked> Show face / hand box</label>
             <label class="check"><input type="checkbox" id="opt-guide"> Show position guide</label>
             <label>Liveness check
               <select id="opt-live">
@@ -114,10 +119,10 @@
       <div id="consent" class="consent">
         <h3>Before you enrol faces</h3>
         <ul>
-          <li><strong>What is stored:</strong> a numeric face template (not a photo) and one small thumbnail per student, encrypted at rest.</li>
+          <li><strong>What is stored:</strong> a numeric face template (not a photo) and one small face thumbnail per student, and/or a numeric palm-line template per enrolled hand (no palm photo), all encrypted at rest.</li>
           <li><strong>Why:</strong> only to mark attendance in this app. It is not shared or used for anything else.</li>
           <li><strong>Consent:</strong> students are minors. A guardian (or the school, per its policy) must consent to biometric data being processed (Japan APPI).</li>
-          <li><strong>Withdrawal:</strong> use <em>Delete face data</em> on the roster at any time. Attendance can still be taken manually.</li>
+          <li><strong>Withdrawal:</strong> use <em>Delete face data</em> / <em>Delete palm data</em> on the roster at any time. Attendance can still be taken manually.</li>
         </ul>
         <label class="check"><input type="checkbox" id="consent-ok"> I understand and consent has been obtained.</label>
         <button class="primary" id="b-consent" disabled>Continue to enrolment</button>
@@ -129,6 +134,14 @@
             <div class="scan"><video id="enroll-video" class="cam" playsinline muted></video><div class="guide"></div><div class="hint" id="enroll-hint">Camera starts…</div></div>
             <label class="check"><input type="checkbox" name="guardian" required> Guardian / school consent obtained for this student</label>
             <button class="primary" id="b-capture">Capture face &amp; add student</button>
+            <div class="row palm-row">
+              <button type="button" id="b-capture-palm">Capture palm &amp; add student</button>
+              <select id="palm-hands" aria-label="Which hand">
+                <option value="Right" selected>Right hand</option>
+                <option value="Left">Left hand</option>
+                <option value="Both">Both hands</option>
+              </select>
+            </div>
             <button type="button" class="link" id="b-cancel-re" hidden>Cancel re-enrol</button>
           </form>
         </div>

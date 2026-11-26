@@ -312,6 +312,17 @@ test('PalmLiveness: a rigid (photo-like) hand never passes; flexing fingers pass
   tips.forEach((t, i) => { close(t.x, tips2[i].x, 1e-9); close(t.y, tips2[i].y, 1e-9); });
 });
 
+test('PalmLiveness: the first frames of a track and a single jumpy frame do not pass', () => {
+  const still = rightPalm(), jumped = rightPalm().map((q, j) => (j === 8 ? { ...q, x: q.x + 60 } : q));
+  const warm = new PalmLiveness();
+  warm.observe(jumped, palmRoi(jumped), 'Right', 0); // detector -> tracker switch: landmarks jump
+  for (let i = 1; i < 40; i++) warm.observe(still, palmRoi(still), 'Right', i * 33);
+  assert.equal(warm.passed, false, `warm-up jump ignored, travel ${warm.travel}`);
+  const one = new PalmLiveness();
+  for (let i = 0; i < 40; i++) { const p = i === 20 ? jumped : still; one.observe(p, palmRoi(p), 'Right', i * 33); }
+  assert.equal(one.passed, false, `one outlier frame ignored, travel ${one.travel}`);
+});
+
 test('PalmLiveness: grip challenge = close then open within the time limit', () => {
   const l = new PalmLiveness({ gripTimeoutMs: 1000 }), open = rightPalm(), fist = rightPalm({ curl: true });
   l.startGrip(0);

@@ -413,29 +413,34 @@ export function palmFrameTips(pts, roi) {
  *  your hand" check (grip), which a photo can't do at all. Thresholds are first guesses: tune with the spike's readout.
  *  NOTE: like the face check, this stops a held-up photo, not a replayed video. */
 export class PalmLiveness {
-  /** @param {{windowMs?: number, flex?: number, gripTimeoutMs?: number}} [opts]
-   *  flex: fingertip travel (max over the 5 tips, in palm widths) within the window that counts as a live hand. */
-  constructor({ windowMs = 2000, flex = 0.06, gripTimeoutMs = 4000 } = {}) {
-    this.windowMs = windowMs; this.flex = flex; this.gripTimeoutMs = gripTimeoutMs;
+  /** @param {{windowMs?: number, flex?: number, gripTimeoutMs?: number, warmupMs?: number, minSamples?: number}} [opts]
+   *  flex: fingertip travel (10th-90th percentile spread, worst of the 5 tips, in palm widths) that counts as a live hand.
+   *  warmupMs: frames this soon after the track starts are ignored: when MediaPipe switches from detecting to tracking
+   *  the hand, landmarks jump, and on a still photo that jump alone used to pass (caught by scripts/e2e-palm.mjs).
+   *  Percentiles (not min-max) so one jumpy frame can't pass either; steady tracking of a still photo moves <= 0.02. */
+  constructor({ windowMs = 2000, flex = 0.06, gripTimeoutMs = 4000, warmupMs = 300, minSamples = 8 } = {}) {
+    this.windowMs = windowMs; this.flex = flex; this.gripTimeoutMs = gripTimeoutMs; this.warmupMs = warmupMs; this.minSamples = minSamples;
+    /** @type {number | null} */ this.startedAt = null;
     /** @type {{t: number, tips: {x: number, y: number}[]}[]} */ this.samples = [];
     this.passed = false; this.travel = 0;
     /** @type {null | {startedAt: number, closed: boolean}} */ this.grip = null;
     this.gripPassed = false;
   }
 
-  reset() { this.samples = []; this.passed = false; this.travel = 0; this.grip = null; this.gripPassed = false; }
+  reset() { this.startedAt = null; this.samples = []; this.passed = false; this.travel = 0; this.grip = null; this.gripPassed = false; }
 
   /** Ask for "close your hand, then open it". @param {number} now */
   startGrip(now) { this.grip = { startedAt: now, closed: false }; this.gripPassed = false; }
 
   /** @param {Pt[]} pts @param {Roi} roi @param {Hand} _hand @param {number} now */
   observe(pts, roi, _hand, now) {
-    this.samples.push({ t: now, tips: palmFrameTips(pts, roi) });
+    this.startedAt ??= now;
+    if (now - this.startedAt >= this.warmupMs) this.samples.push({ t: now, tips: palmFrameTips(pts, roi) });
     while (this.samples.length && now - this.samples[0].t > this.windowMs) this.samples.shift();
     let travel = 0;
-    for (let i = 0; i < 5; i++) {
-      const xs = this.samples.map((s) => s.tips[i].x), ys = this.samples.map((s) => s.tips[i].y);
-      travel = Math.max(travel, Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)));
+    if (this.samples.length >= this.minSamples) {
+      const spread = (/** @type {number[]} */ v) => { v.sort((a, b) => a - b); return v[Math.floor((v.length - 1) * 0.9)] - v[Math.floor((v.length - 1) * 0.1)]; };
+      for (let i = 0; i < 5; i++) travel = Math.max(travel, Math.hypot(spread(this.samples.map((s) => s.tips[i].x)), spread(this.samples.map((s) => s.tips[i].y))));
     }
     this.travel = travel;
     if (travel >= this.flex) this.passed = true;
