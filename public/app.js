@@ -1,7 +1,7 @@
 import { Api } from './api.js';
 import { FaceService } from './face-service.js';
 import { AttendanceService } from './attendance-service.js';
-import { MatchingService, MatchConfirmer, euclidean } from './matching.js';
+import { MatchingService, FaceTracker, iou, faceQuality, SCAN_QUALITY, ENROLL_QUALITY, meanDescriptor, pruneOutliers, rosterReport, euclidean } from './matching.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -9,19 +9,36 @@ const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', m
 const safe = (fn) => { try { return fn(); } catch { return null; } }; // localStorage can throw (private mode)
 
 // ---------- tunables ----------
-const CONFIRM_FRAMES = 3;       // same student must match this many frames in a row
+const CONFIRM_FRAMES = 3;       // good-quality frames fused before deciding (2 if the match is very close)
 const MIN_FACE_RATIO = 0.12;    // scan: ignore faces narrower than this fraction of the frame (far background)
-const ENROLL_MIN_FACE = 0.22;   // enrol: face must be this close
-const BLUR_MIN = 25;            // enrol: min Laplacian variance of the face crop (see README to tune)
-const ENROLL_SAMPLES = 5;
-const ENROLL_PROMPTS = ['Look straight at the camera', 'Turn your head slightly to one side', 'Turn slightly to the other side', 'Look straight again', 'Straight again — relax your face'];
+const FAR_FACE_RATIO = 0.06;    // scan: faces between this and MIN_FACE_RATIO get a "come closer" box
+// Quality limits (pose, size, blur, light) are SCAN_QUALITY / ENROLL_QUALITY in matching.js (see README to tune).
+const ENROLL_SAMPLES = 6;       // captured; outliers are pruned before saving
+const ENROLL_PROMPTS = ['Look straight at the camera', 'Turn your head slightly to one side', 'Turn slightly to the other side', 'Tilt your chin slightly up', 'Look straight again', 'Straight again — relax your face'];
+const PICK_LEARN_MS = 20000;    // teacher picks a student this soon after a miss -> that face may be learned
+const SPOT_RATE = 0.2;          // liveness "spot": share of check-ins that also get a turn-on-cue challenge
+const CHALLENGE_TRIES = 2;      // failed/timed-out cues before "Not verified"
+
+// ---------- kiosk options (per browser) ----------
+const OPTS = { 'opt-box': 'checked', 'opt-guide': 'checked', 'opt-live': 'value' };
+for (const [id, prop] of Object.entries(OPTS)) {
+  const input = document.getElementById(id);
+  const saved = safe(() => localStorage.getItem(id));
+  if (saved != null) input[prop] = prop === 'checked' ? saved === '1' : saved;
+  input.addEventListener('change', () => { safe(() => localStorage.setItem(id, prop === 'checked' ? (input.checked ? '1' : '0') : input.value)); applyOpts(); });
+}
+function applyOpts() {
+  document.getElementById('guide').hidden = !document.getElementById('opt-guide').checked;
+  if (!document.getElementById('opt-box').checked) { const c = document.getElementById('face-canvas'); c.getContext('2d').clearRect(0, 0, c.width, c.height); }
+}
+applyOpts();
 const RESULT_MS = 1500;         // how long the "recognised" card stays up
 const UNKNOWN_MS = 5000;
 const COOLDOWN_MS = 6000;       // ignore a just-handled student for a moment
 const UNDO_COOLDOWN_MS = 15000;
 
 const face = new FaceService(window.faceapi);
-const matcher = new MatchingService({ threshold: 0.5, gap: 0.04 });
+const matcher = new MatchingService({ threshold: 0.5, gap: 0.04, ratio: 0.8, k: 2 });
 const attendance = new AttendanceService({
   send: (sessionId, studentId, scannedAt) => Api.markPresent(sessionId, studentId, scannedAt),
   storage: safe(() => localStorage) ?? undefined,
@@ -35,6 +52,9 @@ let present = new Map();           // studentId -> {name, scannedAt, source}
 let tab = null, loopRun = 0, paused = false, consented = false, enrollTarget = null;
 let syncTimer = 0, pollTimer = 0, viewing = null;
 const cooldown = new Map();       // studentId -> epoch ms until which the scanner ignores this student
+const learned = new Map();        // studentId -> descriptor learned this session (removed again on "Wrong person")
+let verifier = Promise.resolve(false); // resolves true once the enrolment verifier (SSD) is loaded
+let lastFace = null;              // {descriptor, at}: last fused face that was not recognised or was undone
 
 function msg(text = '', ok = false) { const m = $('#msg'); m.textContent = text; m.className = 'msg' + (ok ? ' ok' : ''); }
 function hint(sel, text, kind = '') { const el = $(sel); el.textContent = text; el.className = 'hint ' + kind; }
@@ -105,7 +125,7 @@ function showResult(kind, { name, sub = '', thumbnail = '', undoId = null, picke
   $('#result-name').textContent = name; $('#result-sub').textContent = sub;
   const img = $('#result-img'); img.hidden = !thumbnail; if (thumbnail) img.src = thumbnail;
   $('#result-undo').hidden = undoId == null; $('#result-undo').onclick = () => undoMark(undoId, true);
-  $('#result-pick').hidden = !picker; $('#result-pick').onclick = () => { r.hidden = true; openPicker('Who is this?'); };
+  $('#result-pick').hidden = !picker; $('#result-pick').onclick = () => { r.hidden = true; openPicker('Who is this?', true); };
   clearTimeout(resultTimer); resultTimer = setTimeout(() => (r.hidden = true), ms);
 }
 
@@ -135,7 +155,7 @@ async function startScan() {
 }
 
 async function scanLoop(alive, video) {
-  const confirmers = new Map(); // studentId -> MatchConfirmer
+  const tracker = new FaceTracker();
   cooldown.clear();
   const guide = $('#guide');
   let unknownStreak = 0, unknownUntil = 0, fps = 0, last = performance.now();
@@ -143,62 +163,92 @@ async function scanLoop(alive, video) {
   while (alive()) {
     if (paused || document.hidden) { await sleep(300); continue; }
     if (!video.videoWidth) { await sleep(100); continue; }
-    const now = Date.now();
-    const gate = await face.gate(video);
-    if (!alive()) return;
-    if (!gate.some((b) => b.width / video.videoWidth >= MIN_FACE_RATIO)) {
-      for (const c of confirmers.values()) c.miss(now);
-      unknownStreak = 0; guide.className = 'guide';
-      hint('#kiosk-hint', 'Ready — walk up and look at the camera');
-      drawDebug(video, null, null, fps); await sleep(120); continue;
+    const W = video.videoWidth;
+    // Cheap 160px presence gate only while nobody is being followed; mid check-in, go straight to the full pipeline.
+    if (!tracker.active(Date.now())) {
+      const gate = (await face.gate(video)).filter((b) => b.width / W >= FAR_FACE_RATIO);
+      if (!alive()) return;
+      const close = gate.filter((b) => b.width / W >= MIN_FACE_RATIO);
+      if (!close.length) {
+        unknownStreak = 0; guide.className = 'guide';
+        hint('#kiosk-hint', gate.length ? 'Come closer to the camera' : 'Ready — walk up and look at the camera', gate.length ? 'warn' : '');
+        drawOverlay(video, gate.map((box) => ({ box, kind: 'far' })));
+        drawDebug(video, null, 0, fps); await sleep(gate.length ? 60 : 120); continue;
+      }
+      drawOverlay(video, close.map((box) => ({ box, kind: 'detect' }))); // instant box while the heavy step runs
     }
 
-    const faces = (await face.analyze(face.snapshot(video))).filter((f) => f.box.width / video.videoWidth >= MIN_FACE_RATIO);
+    const canvas = face.snapshot(video);
+    const faces = (await face.analyze(canvas)).filter((f) => f.box.width / W >= MIN_FACE_RATIO).sort((a, b) => b.box.width - a.box.width);
     if (!alive()) return;
     const t = Date.now();
-    const seen = new Set();
-    let anyUnknown = false, status = null, dbg = null;
+    const mode = $('#opt-live').value; // off | passive | spot | challenge
+    let anyUnknown = false, anyKnown = false, status = null, dbg = null;
+    const boxes = [];
 
-    for (const f of faces.sort((a, b) => b.box.width - a.box.width)) {
-      const m = matcher.match(f.descriptor, students);
-      dbg ??= { f, m };
-      if (!m.student) { anyUnknown = true; continue; }
-      const id = m.student.id;
-      seen.add(id);
-      if ((cooldown.get(id) ?? 0) > t) continue;
-      let c = confirmers.get(id);
-      if (!c) confirmers.set(id, (c = new MatchConfirmer({ frames: CONFIRM_FRAMES, requireLiveness: $('#dbg-live').checked })));
-      c.requireLiveness = $('#dbg-live').checked;
-      const r = c.observe(t, f);
-      if (dbg.f === f) dbg.conf = r;
-      if (r.waitingForLiveness) status = ['Please blink or turn your head slightly', 'warn'];
-      else status ??= [`Hello ${m.student.name}… hold still`, 'ok'];
-      if (r.confirmed) {
-        c.reset(); cooldown.set(id, t + COOLDOWN_MS);
-        await handleConfirmed(students.find((s) => s.id === id), alive);
-        if (!alive()) return;
-      }
+    for (const { face: f, track } of tracker.assign(faces, t)) {
+      const q = faceQuality({ ...f, faceRatio: f.box.width / W, ...face.quality(canvas, f.box) }, SCAN_QUALITY);
+      track.observe(f, q.ok, t);
+      if (mode === 'spot') track.spot ??= Math.random() < SPOT_RATE;
+      const requireChallenge = mode === 'challenge' || (mode === 'spot' && !!track.spot);
+      const r = track.decide(matcher, students, { frames: CONFIRM_FRAMES, requireLiveness: mode !== 'off', requireChallenge });
+      const m = r.match;
+      dbg ??= { f, q, r, track };
+      const box = { box: f.box, kind: 'detect', label: '' };
+      boxes.push(box);
+
+      if (m?.student) {
+        const id = m.student.id;
+        anyKnown = true;
+        Object.assign(box, { kind: 'ok', label: m.student.name });
+        if ((cooldown.get(id) ?? 0) > t || track.handled === id) continue;
+        if (r.waitingForChallenge) {
+          if (track.challengeFails >= CHALLENGE_TRIES) {
+            track.handled = id; cooldown.set(id, t + COOLDOWN_MS);
+            Object.assign(box, { kind: 'bad', label: 'Not verified' });
+            showResult('unknown', { name: 'Not verified', sub: 'Ask the teacher to mark you manually.', picker: true, ms: UNKNOWN_MS });
+            continue;
+          }
+          if (!track.challenge) track.startChallenge(Math.random() < 0.5 ? 'left' : 'right', f.yaw, t);
+          const arrow = screenArrow(track.challenge.dir);
+          Object.assign(box, { kind: 'warn', label: arrow });
+          status ??= [`Turn your head ${arrow}`, 'warn'];
+        } else if (r.waitingForLiveness) { box.kind = 'warn'; status ??= ['Please blink or turn your head slightly', 'warn']; }
+        else status ??= [`Hello ${m.student.name}… hold still`, 'ok'];
+        if (r.confirmed) {
+          track.handled = id; cooldown.set(id, t + COOLDOWN_MS);
+          const learn = q.ok && matcher.shouldAdapt(m) ? track.fused() : null;
+          await handleConfirmed(students.find((s) => s.id === id), alive, learn, track.fused());
+          if (!alive()) return;
+        }
+      } else if (m && r.frames >= CONFIRM_FRAMES) {
+        anyUnknown = true; Object.assign(box, { kind: 'bad', label: 'Not recognised' });
+        lastFace = { descriptor: track.fused(), at: t };
+      } else if (!q.ok) { box.kind = 'warn'; status ??= [q.hint, 'warn']; }
+      else status ??= ['Hold still…', ''];
     }
-    for (const [id, c] of confirmers) { if (!seen.has(id)) { c.miss(t); if (c.idle(t)) confirmers.delete(id); } }
 
-    if (anyUnknown && !seen.size) {
+    if (anyUnknown && !anyKnown) {
       status = ['Face not recognised', 'bad'];
-      if (++unknownStreak >= 3 && t > unknownUntil) {
+      if (++unknownStreak >= 2 && t > unknownUntil) {
         showResult('unknown', { name: 'Not recognised', sub: 'Ask the student to face the camera, or pick them manually.', picker: true, ms: UNKNOWN_MS });
         unknownUntil = t + UNKNOWN_MS + 1500;
       }
     } else unknownStreak = 0;
-    guide.className = 'guide ' + (status?.[1] ?? '');
+    guide.className = 'guide ' + (status?.[1] ?? (faces.length ? 'ok' : ''));
     if (status) hint('#kiosk-hint', status[0], status[1]);
 
     const nowP = performance.now(); fps = fps * 0.8 + (1000 / (nowP - last)) * 0.2; last = nowP;
-    drawDebug(video, dbg, faces, fps);
-    await sleep(30); // yield to the UI; the inference itself is the real rate limiter
+    drawOverlay(video, boxes);
+    drawDebug(video, dbg, faces.length, fps);
+    await sleep(15); // yield to the UI; the inference itself is the real rate limiter
   }
 }
 
-async function handleConfirmed(student, alive) {
+/** @param learn fused descriptor to add to the student's template (Face ID-style), or null */
+async function handleConfirmed(student, alive, learn = null, fused = null) {
   if (!student) return;
+  lastFace = fused ? { descriptor: fused, at: Date.now(), studentId: student.id } : null;
   const base = { name: student.name, thumbnail: student.thumbnail ?? '' };
   if (present.has(student.id)) return showResult('already', { ...base, sub: 'Already checked in' });
   try {
@@ -207,7 +257,10 @@ async function handleConfirmed(student, alive) {
     present.set(student.id, { name: student.name, scannedAt: r.scannedAt, source: 'face' });
     renderCount();
     if (r.status === 'saved' && r.already) showResult('already', { ...base, sub: 'Already checked in' });
-    else showResult('ok', { ...base, sub: r.status === 'queued' ? '✓ Saved offline — will sync' : '✓ Present', undoId: student.id });
+    else {
+      showResult('ok', { ...base, sub: r.status === 'queued' ? '✓ Saved offline — will sync' : '✓ Present', undoId: student.id });
+      if (learn && r.status === 'saved') learnFace(student, learn);
+    }
   } catch (e) {
     showResult('error', { name: 'Could not save', sub: e.message, ms: 3000 });
   }
@@ -220,32 +273,80 @@ async function undoMark(id, thenPick) {
     if (!attendance.cancel(session.id, id)) await Api.setPresent(session.id, id, false);
     present.delete(id); renderCount();
     cooldown.set(id, Date.now() + UNDO_COOLDOWN_MS); // don't instantly re-mark the same face
+    forgetFace(id);
+    if (lastFace?.studentId === id) lastFace = { descriptor: lastFace.descriptor, at: Date.now() }; // "who is this?" can learn it
     $('#result').hidden = true;
-    if (thenPick) openPicker('Who is this?');
+    if (thenPick) openPicker('Who is this?', true);
   } catch (e) { msg(e.message); }
 }
 
-// ----- debug overlay -----
-function drawDebug(video, dbg, faces, fps) {
-  const on = $('#dbg-toggle').checked;
-  $('#dbg-canvas').hidden = !on; $('#dbg-text').hidden = !on;
-  if (!on) return;
-  const cv = $('#dbg-canvas');
-  cv.width = video.videoWidth; cv.height = video.videoHeight;
-  cv.classList.toggle('rear', facing !== 'user');
+// ----- template update (like Face ID: learn from confident matches, never touch the original enrolment) -----
+function learnFace(student, descriptor) {
+  if (!session || learned.has(student.id)) return;
+  learned.set(student.id, descriptor);
+  student.descriptors = [...student.descriptors, descriptor];
+  Api.learnFace(student.id, session.id, descriptor).catch(() => {}); // best effort
+}
+function forgetFace(id) {
+  const d = learned.get(id); if (!d) return;
+  learned.delete(id);
+  const s = students.find((x) => x.id === id);
+  if (s) s.descriptors = s.descriptors.filter((x) => x !== d);
+  Api.forgetFace(id, session.id).catch(() => {});
+}
+
+/** Arrow for "turn to your left/right" as the student sees it: the front camera preview is mirrored. */
+const screenArrow = (dir) => ((dir === 'left') === (facing === 'user') ? '←' : '→');
+
+// ----- face box overlay (toggle: Show face box) + debug text -----
+const BOX_COLORS = { far: '#ffffff88', detect: '#ffffff', warn: '#fbbf24', ok: '#4ade80', bad: '#f87171' };
+function drawOverlay(video, boxes) {
+  const cv = $('#face-canvas');
+  if (cv.width !== video.videoWidth) { cv.width = video.videoWidth; cv.height = video.videoHeight; }
+  const mirrored = facing === 'user';
+  cv.classList.toggle('rear', !mirrored);
   const ctx = cv.getContext('2d'); ctx.clearRect(0, 0, cv.width, cv.height);
-  ctx.lineWidth = 3;
-  for (const f of faces ?? []) { ctx.strokeStyle = dbg?.f === f ? '#4ade80' : '#fbbf24'; ctx.strokeRect(f.box.x, f.box.y, f.box.width, f.box.height); }
-  const lines = [`fps ${fps.toFixed(1)}  faces ${faces?.length ?? 0}  threshold ${matcher.threshold.toFixed(2)}`];
+  if (!$('#opt-box').checked) return;
+  const lw = Math.max(3, cv.width / 250);
+  for (const { box, kind, label } of boxes) {
+    const c = BOX_COLORS[kind] ?? '#fff', r = box.width * 0.12;
+    ctx.strokeStyle = c; ctx.lineWidth = kind === 'far' ? lw / 2 : lw;
+    // corner brackets: reads as "I see you" without hiding the face
+    ctx.beginPath();
+    for (const [x, y, dx, dy] of [[box.x, box.y, 1, 1], [box.x + box.width, box.y, -1, 1], [box.x, box.y + box.height, 1, -1], [box.x + box.width, box.y + box.height, -1, -1]]) {
+      ctx.moveTo(x, y + dy * r); ctx.lineTo(x, y); ctx.lineTo(x + dx * r, y);
+    }
+    ctx.stroke();
+    if (!label) continue;
+    // the canvas is mirrored by CSS like the video; un-mirror the text
+    ctx.save();
+    const fs = Math.max(18, box.width / 7);
+    ctx.font = `600 ${fs}px system-ui, sans-serif`; ctx.textBaseline = 'bottom';
+    const tw = ctx.measureText(label).width, cx = box.x + box.width / 2, y = box.y - lw * 2;
+    if (mirrored) { ctx.translate(cv.width, 0); ctx.scale(-1, 1); }
+    const x = (mirrored ? cv.width - cx : cx) - tw / 2;
+    ctx.fillStyle = '#000a'; ctx.fillRect(x - 6, y - fs - 4, tw + 12, fs + 8);
+    ctx.fillStyle = c; ctx.fillText(label, x, y);
+    ctx.restore();
+  }
+}
+
+// ----- debug overlay -----
+function drawDebug(video, dbg, nFaces, fps) {
+  const on = $('#dbg-toggle').checked;
+  $('#dbg-text').hidden = !on;
+  if (!on) return;
+  const lines = [`fps ${fps.toFixed(1)}  faces ${nFaces}  threshold ${matcher.threshold.toFixed(2)}`];
   if (dbg) {
-    const { f, m, conf } = dbg;
-    lines.push(`best ${m.student?.name ?? '—'}  dist ${Number.isFinite(m.distance) ? m.distance.toFixed(3) : '—'}  next ${Number.isFinite(m.runnerUp) ? m.runnerUp.toFixed(3) : '—'}  (${m.reason})`);
-    lines.push(`face ${(f.box.width / video.videoWidth * 100) | 0}% of frame  EAR ${f.ear.toFixed(2)}  yaw ${f.yaw.toFixed(2)}`);
-    if (conf) lines.push(`hits ${conf.hits}/${CONFIRM_FRAMES}  blink ${conf.liveness.blink ? 'Y' : 'n'}  turn ${conf.liveness.turn ? 'Y' : 'n'}  live ${conf.liveness.passed ? 'OK' : '…'}`);
+    const { f, q, r, track } = dbg, m = r.match;
+    const n = (x) => (Number.isFinite(x) ? x.toFixed(3) : '—');
+    if (m) lines.push(`best ${m.student?.name ?? '—'}  dist ${n(m.distance)}  next ${n(m.runnerUp)}  (${m.reason})`);
+    lines.push(`face ${(f.box.width / video.videoWidth * 100) | 0}%  score ${f.score.toFixed(2)}  roll ${f.roll.toFixed(0)}°  yaw ${f.yaw.toFixed(2)}  EAR ${f.ear.toFixed(2)}`);
+    lines.push(`quality ${q.ok ? 'OK' : q.reason}  fused ${r.frames}/${CONFIRM_FRAMES}  live ${track.liveness.passed ? 'OK' : '…'}`);
   }
   $('#dbg-text').textContent = lines.join('\n');
 }
-$('#dbg-toggle').onchange = (e) => { $('#dbg-panel').hidden = !e.target.checked; if (!e.target.checked) { $('#dbg-canvas').hidden = true; $('#dbg-text').hidden = true; } };
+$('#dbg-toggle').onchange = (e) => { $('#dbg-panel').hidden = !e.target.checked; if (!e.target.checked) $('#dbg-text').hidden = true; };
 $('#dbg-thr').oninput = (e) => { matcher.threshold = Number(e.target.value); $('#dbg-thr-val').textContent = matcher.threshold.toFixed(2); safe(() => localStorage.setItem('faceThreshold', String(matcher.threshold))); };
 
 $('#b-kiosk').onclick = (e) => { paused = !paused; e.target.textContent = paused ? 'Resume' : 'Pause'; hint('#kiosk-hint', paused ? 'Paused' : 'Ready'); };
@@ -254,8 +355,10 @@ $('#b-manual').onclick = () => openPicker('Mark student present');
 document.addEventListener('click', (e) => { const o = e.target.closest('[data-open]'); if (o) openTab(o.dataset.open); });
 
 // ----- manual picker -----
-function openPicker(title) {
+let pickerLearn = false; // picker answers "who is this?" for the face just seen -> the template may learn it
+function openPicker(title, learn = false) {
   if (!session) return msg('Start a session first.');
+  pickerLearn = learn;
   $('#picker-title').textContent = title; $('#picker-q').value = ''; $('#picker').hidden = false;
   renderPicker(); $('#picker-q').focus();
 }
@@ -270,6 +373,10 @@ function renderPicker() {
       try {
         await Api.setPresent(session.id, s.id, true);
         present.set(s.id, { name: s.name, scannedAt: Date.now(), source: 'manual' }); renderCount();
+        // Like Face ID after a passcode: a near-miss the teacher identifies becomes part of the template.
+        if (pickerLearn && lastFace && Date.now() - lastFace.at < PICK_LEARN_MS && s.descriptors?.length
+            && matcher.score(lastFace.descriptor, s) <= matcher.threshold + 0.12) learnFace(s, lastFace.descriptor);
+        lastFace = null;
         $('#picker').hidden = true;
         showResult('ok', { name: s.name, sub: '✓ Marked manually', thumbnail: s.thumbnail ?? '' });
       } catch (err) { msg(err.message); }
@@ -375,7 +482,22 @@ async function loadRoster() {
   }
 }
 
+$('#b-roster-check').onclick = () => {
+  const r = rosterReport(students, matcher), out = $('#roster-report');
+  const f = (x) => (Number.isFinite(x) ? x.toFixed(2) : '—');
+  const lines = [
+    `Own samples vs own template (95% of them under): ${f(r.genuineP95)}`,
+    `Closest two different students: ${f(r.impostorMin)}`,
+    `Current threshold: ${matcher.threshold.toFixed(2)}   Suggested: ${r.suggested.toFixed(2)}`,
+  ];
+  if (r.overlap) lines.push('⚠ Some students are about as close to each other as to themselves: re-enrol them in better light, or mark them manually.');
+  for (const p of r.lookAlikes) lines.push(`⚠ Look-alikes: ${p.a.name} ↔ ${p.b.name} (${f(p.d)}) — scan both and check for wrong marks`);
+  if (!r.lookAlikes.length && Number.isFinite(r.impostorMin)) lines.push('✓ No look-alike pairs near the threshold.');
+  out.textContent = lines.join('\n'); out.hidden = false;
+};
+
 async function openStudents() {
+  $('#roster-report').hidden = true;
   $('#consent').hidden = false; $('#enroll-wrap').hidden = true;
   $('#consent-ok').checked = false; $('#b-consent').disabled = true;
   await loadRoster().catch((e) => msg(e.message));
@@ -386,6 +508,7 @@ $('#b-consent').onclick = async () => {
   const run = loopRun;
   hint('#enroll-hint', 'Starting camera…');
   try { await face.load(); } catch { return hint('#enroll-hint', 'Could not load face models. Reload the page.', 'bad'); }
+  verifier = face.loadVerifier().then(() => true, () => false); // enrolment-only detector; scanning never waits for it
   try { await startCamera($('#enroll-video')); } catch (e) { return hint('#enroll-hint', cameraError(e), 'bad'); }
   if (run === loopRun) hint('#enroll-hint', 'Type a name, then press Capture');
 };
@@ -408,29 +531,45 @@ $('#f-student').addEventListener('submit', async (e) => {
   if (!stream) return msg('Camera is not running.');
   btn.disabled = true; msg();
   try {
-    const samples = [], deadline = Date.now() + 45000;
-    let thumb = null, rejects = 0;
+    const samples = [], deadline = Date.now() + 45000, rejects = {};
+    let thumb = null;
     while (samples.length < ENROLL_SAMPLES && Date.now() < deadline && run === loopRun) {
       const canvas = face.snapshot(video);
       const faces = await face.analyze(canvas);
       const f = faces[0];
+      // Second opinion from the accurate detector: exactly one face, at the same place, with a confident score.
+      const ssd = f && faces.length === 1 && (await verifier) ? await face.verify(canvas) : null;
+      const same = ssd?.find((d) => iou(d.box, f.box) >= 0.4);
+      const limits = ssd ? ENROLL_QUALITY : { ...ENROLL_QUALITY, minScore: 0.6 }; // Tiny scores run lower
+      const q = f && faceQuality({ ...f, score: ssd ? same?.score ?? 0 : f.score, faceRatio: f.box.width / video.videoWidth, ...face.quality(canvas, f.box) }, limits);
       if (faces.length === 0) hint('#enroll-hint', 'No face detected — look at the camera', 'warn');
-      else if (faces.length > 1) hint('#enroll-hint', 'Multiple faces — one student only', 'warn');
-      else if (f.box.width / video.videoWidth < ENROLL_MIN_FACE) hint('#enroll-hint', 'Move closer to the camera', 'warn');
-      else if (face.sharpness(canvas, f.box) < BLUR_MIN) { rejects++; hint('#enroll-hint', 'Image is blurry — hold still / improve lighting', 'warn'); }
-      else if (samples.length && Math.min(...samples.map((x) => euclidean(f.descriptor, x))) > 0.55) hint('#enroll-hint', 'Face changed — keep the same student in view', 'warn');
+      else if (faces.length > 1 || ssd?.filter((d) => d.score >= 0.5).length > 1) hint('#enroll-hint', 'Multiple faces — one student only', 'warn');
+      else if (!q.ok) { rejects[q.reason] = (rejects[q.reason] ?? 0) + 1; hint('#enroll-hint', q.hint, 'warn'); }
+      else if (samples.length && euclidean(f.descriptor, meanDescriptor(samples)) > 0.5) hint('#enroll-hint', 'Face changed — keep the same student in view', 'warn');
       else {
         samples.push(f.descriptor);
         thumb ??= face.thumbnail(canvas, f.box);
         hint('#enroll-hint', `Captured ${samples.length}/${ENROLL_SAMPLES} — next: ${ENROLL_PROMPTS[samples.length % ENROLL_PROMPTS.length]}`, 'ok');
-        await sleep(1100); // time to change pose
+        await sleep(1000); // time to change pose
         continue;
       }
-      await sleep(250);
+      await sleep(200);
     }
     if (run !== loopRun) return;
-    if (samples.length < ENROLL_SAMPLES) throw new Error(rejects > 3 ? 'Images were too blurry. Improve lighting and try again.' : 'Could not capture a clear face. Try again.');
-    if (enrollTarget) await Api.reenroll(enrollTarget.id, samples, thumb); else await Api.addStudent(name, samples, thumb);
+    if (samples.length < ENROLL_SAMPLES) {
+      const worst = Object.entries(rejects).sort((a, b) => b[1] - a[1])[0]?.[0];
+      const why = { blur: 'Images were too blurry', dark: 'It was too dark', bright: 'It was too bright', roll: 'The head was tilted', yaw: 'The face was turned away', small: 'The face was too far away' }[worst];
+      throw new Error((why ? why + '. ' : 'Could not capture a clear face. ') + 'Improve lighting / position and try again.');
+    }
+    const kept = pruneOutliers(samples, { maxDist: 0.4, keep: 4 });
+    // Duplicate check: is this face already enrolled under another name? (two templates for one face = wrong marks)
+    const others = students.filter((s) => s.id !== enrollTarget?.id && s.descriptors?.length);
+    const c = meanDescriptor(kept);
+    const dup = others.map((s) => ({ s, d: matcher.score(c, s) })).sort((a, b) => a.d - b.d)[0];
+    if (dup && dup.d <= matcher.threshold && !confirm(`This face looks like ${dup.s.name}, who is already enrolled. Save anyway? (Only for twins/siblings — otherwise use Re-enrol on ${dup.s.name}.)`)) {
+      return hint('#enroll-hint', 'Not saved (possible duplicate).', 'warn');
+    }
+    if (enrollTarget) await Api.reenroll(enrollTarget.id, kept, thumb); else await Api.addStudent(name, kept, thumb);
     const done = enrollTarget?.name ?? name;
     $('#b-cancel-re').onclick(); form.reset();
     await loadRoster();

@@ -7,7 +7,7 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (49)
+npm test             # unit + API tests (62)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
 ```
 
@@ -26,11 +26,21 @@ The first time, dismiss Chrome's first-run prompts and allow the camera. The emu
 
 | Step | Where | Notes |
 |---|---|---|
-| Cheap gate (160px detector) | browser | skips the heavy work when nobody is in front of the camera |
-| Detect -> landmarks -> embedding | browser | 224px TinyFaceDetector; the frame is frozen on a canvas first |
-| 1:N match | browser, [matching.js](public/matching.js) | `MatchingService`, Euclidean (cosine supported), threshold + look-alike gap |
-| Confirm | browser | **3 consecutive frames** of the same student **and** liveness (blink or head turn) |
+Modelled on how production systems (Face ID, AWS Rekognition, Azure Face) structure it: detect -> quality gate -> align -> embed -> match -> decide -> update the template.
+
+| Step | Where | Notes |
+|---|---|---|
+| Cheap gate (160px detector) | browser | only while nobody is being tracked; skipped mid check-in to save a pass |
+| Detect -> landmarks -> embedding | browser | 224px TinyFaceDetector on a frozen frame. **Tilted heads (> 6°) are straightened** before the embedding (face-api doesn't; dlib does): same-person distance halved on our fixtures |
+| Face box | browser | corner box + name over each face: white = seen, amber = needs something, green = recognised, red = not recognised. **Show face box** (default on) / **Show position guide** (oval, default off; a soft target, never required) |
+| Quality gate | browser, `faceQuality` | size, tilt, pose, light, blur, detector score. **Lenient at scan** (`SCAN_QUALITY`, a bad frame is just skipped), **strict at enrolment** (`ENROLL_QUALITY`) |
+| Track + fuse | browser, `FaceTracker` | each face is followed by box overlap; its good frames are **averaged into one descriptor** (less noise than any single frame); a different face in the same spot restarts it |
+| 1:N match | browser, [matching.js](public/matching.js) | score = mean of the student's **2 nearest** samples (one stray sample can't attract strangers); threshold + gap + **ratio test** (best/next <= 0.8) |
+| Confirm | browser | 3 fused frames (2 if the match is very close) **and** the liveness check below, on the same tracked face |
+| Learn | `POST /api/students/:id/face/learned` | Face ID-style: a clear match (0.15-0.35, big margin) or a teacher-picked near miss adds one sample per student per session to a **separate pool of 5** (FIFO). Never touches the enrolment; refused if far from it; **Wrong person** removes it; re-enrol clears it |
 | Save | `AttendanceService` -> `/api/sessions/:id/attendance` | idempotent; queued in `localStorage` while offline, replayed with the real timestamp |
+
+Enrolment (strict, slower is fine): 6 samples with pose prompts through the strict gate, each double-checked by the **SSD detector** (exactly one face, score >= 0.8; loaded only on the Students tab, never by the scanner; the stored descriptor still comes from the Tiny pipeline so it matches what the scanner computes), the outlier farthest from the medoid dropped, and a **duplicate check** (warns if the face is already enrolled under another name).
 
 Mirroring: the video is only mirrored by CSS for display. Detection and embedding use the raw (un-mirrored) frame, so there is no mirror/rotation mismatch between enrolment and scanning.
 
@@ -55,16 +65,28 @@ Mirroring: the video is only mirrored by CSS for display. Detection and embeddin
 - Old PoC tables (`students`, `attendance`) are renamed `*_legacy` on first start, not deleted.
 
 ## Tuning the threshold
+Quickest: **Students -> Check roster**. It compares every student's samples with their own template and with every other student, lists look-alike pairs, and suggests a threshold that stays below the closest pair of different students.
+
+By hand:
 1. Open **Scan**, tick **Debug overlay**.
 2. Have each enrolled student walk up. Note `dist` (distance to the best match) and `next` (the next-best *other* student).
 3. Have a few **non-enrolled** people (and look-alikes / siblings) walk up. Note their `dist`.
 4. Set the slider **between** the two groups, closer to the genuine side. Wrong matches are worse than "not recognised", so err strict.
    The value is remembered per browser; the server default is `FACE_THRESHOLD` (0.5). `gap` (default 0.04) makes the scanner refuse when two students are almost equally close.
 - Rough guide for these dlib embeddings: same person ~0.2-0.45, different people usually > 0.55.
-- Blur check: `BLUR_MIN` in `public/app.js` (Laplacian variance of the face crop). Raise it if blurry enrolments slip through; lower it if sharp ones are rejected.
+- Quality limits: `SCAN_QUALITY` / `ENROLL_QUALITY` in `public/matching.js` (blur = Laplacian variance of a 96px face crop, brightness 0-255, roll in degrees after straightening). Debug overlay shows `quality <reason>` when a frame is skipped. Keep the scan limits loose: a rejected frame costs ~100 ms per student.
 
 ## Liveness (what it does and does not stop)
-A blink (eye-aspect-ratio dip) or a head turn (yaw swing of >= 0.12 from landmarks) is required before a mark. A **still photo or a photo on a screen** produces neither, so it is rejected (covered by the e2e "SPOOF" step). A **video replay** of the student blinking/turning can pass. If that matters, add a depth/IR or challenge-response check, or supervise the kiosk.
+Scan sidebar -> **Liveness check** (saved per browser):
+
+| Mode | What the student does | Speed | Stops |
+|---|---|---|---|
+| **Blink or head turn** (default) | nothing special: a natural blink or small head movement within 4 s | fast | held-up photo / photo on a screen |
+| **+ random spot checks** | 1 in 5 check-ins also get "Turn your head ←/→" on cue | fast on average | as above, and makes a replayed video a gamble |
+| **Turn on cue, every student** | "Turn your head ←/→" in a random direction, within 4 s | ~1 s slower each | as above for every check-in |
+| Off | nothing | fastest | nothing (photos pass) |
+
+Turn on cue: the direction is random and judged against where the head started; turning the wrong way fails at once, so a video that wiggles both ways doesn't pass. After 2 failed cues the card says **Not verified** and offers the manual picker. A replayed video still has ~50% per cue of turning the right way; real protection against replays needs depth/IR hardware or supervision.
 
 ## Testing checklist (do on a real iPad before relying on it)
 - [ ] **Similar-looking students** (siblings/twins): enrol both, scan each; expect the right name or "Not recognised", never the wrong one. If one is accepted wrongly, lower the threshold / raise `gap`.

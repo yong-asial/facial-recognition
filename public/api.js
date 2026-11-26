@@ -26,6 +26,8 @@ export const Api = {
   students: async () => (await json('/students')).students,
   addStudent: async (name, descriptors, thumbnail) => (await json('/students', { name, descriptors, thumbnail, consent: true })).student,
   reenroll: async (id, descriptors, thumbnail) => (await json(`/students/${id}/face`, { descriptors, thumbnail, consent: true }, 'PUT')).student,
+  learnFace: (id, sessionId, descriptor) => call(`/students/${id}/face/learned`, { sessionId, descriptor }),
+  forgetFace: (id, sessionId) => call(`/students/${id}/face/learned/${sessionId}`, undefined, 'DELETE'),
   deleteFace: (id) => call(`/students/${id}/face`, undefined, 'DELETE'),
   deleteStudent: (id) => call(`/students/${id}`, undefined, 'DELETE'),
   // sessions / attendance

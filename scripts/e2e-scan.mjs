@@ -28,6 +28,7 @@ const until = async (fn, label, timeout = 60000) => {
 // Headless Chrome stops delivering CDP mouse/key events once the fake camera is running, so drive the DOM directly.
 const click = (page, sel) => page.$eval(sel, (e) => e.click());
 const setVal = (page, sel, v) => page.$eval(sel, (e, v) => { e.value = v; }, v);
+const setOpt = (page, sel, v) => page.$eval(sel, (e, v) => { if (e.type === 'checkbox') e.checked = v; else e.value = v; e.dispatchEvent(new Event('change')); }, v);
 const text = (page, sel) => page.$eval(sel, (e) => e.textContent).catch(() => '');
 const visible = (page, sel) => page.$eval(sel, (e) => !e.hidden).catch(() => false);
 const present = (page) => text(page, '#k-present');
@@ -90,8 +91,8 @@ try {
   await setVal(page, '#f-student [name=name]', 'Alice');
   await click(page, '#f-student [name=guardian]');
   await click(page, '#b-capture');
-  await until(async () => (await text(page, '#s-count')) === '1', 'student added');
-  check((await text(page, '#s-list')).includes('Alice'), 'Alice enrolled (5 samples, quality-checked)');
+  await until(async () => (await text(page, '#s-count')) === '1', 'student added').catch(async (e) => { throw new Error(`${e.message} (hint: "${await text(page, '#enroll-hint')}", msg: "${await text(page, '#msg')}")`); });
+  check((await text(page, '#s-list')).includes('Alice'), 'Alice enrolled (6 samples, strict quality gate, outliers pruned)');
   check(await page.$eval('#s-list img', (i) => i.src.startsWith('data:image/jpeg')), 'thumbnail stored for the confirmation card');
 
   console.log('4. SPOOF: a still photo is not accepted while liveness is on');
@@ -100,10 +101,11 @@ try {
   await new Promise((r) => setTimeout(r, 6000));
   check((await present(page)) === '0', 'still photo NOT marked present');
   check(/blink/i.test(await text(page, '#kiosk-hint')), 'asks to blink or turn: "' + (await text(page, '#kiosk-hint')) + '"');
+  check(await page.$eval('#opt-box', (e) => e.checked) && await page.$eval('#guide', (e) => e.hidden), 'defaults: face box on, position guide off');
 
   console.log('5. recognised + undo + manual picker (liveness off)');
   await click(page, '#dbg-toggle');
-  await click(page, '#dbg-live');
+  await setOpt(page, '#opt-live', 'off');
   const t1 = Date.now();
   await until(async () => (await present(page)) === '1', 'Alice marked');
   console.log(`  marked ${((Date.now() - t1) / 1000).toFixed(1)}s after liveness off`);
@@ -146,10 +148,29 @@ try {
   await until(async () => (await present(page)) === '1', 'live person marked', 90000);
   console.log(`  marked in ${((Date.now() - t2) / 1000).toFixed(1)}s (incl. camera + model warm-up)`);
   check((await text(page, '#result-name')) === 'Alice', 'Alice recognised with liveness ON');
+  check(await page.$eval('#face-canvas', (c) => c.width > 0), 'face box overlay is drawn');
+  if (process.env.E2E_SHOTS) await page.$('#scan-box').then((e) => e.screenshot({ path: `${process.env.E2E_SHOTS}/recognised.png` }));
   await click(page, '#b-kiosk');
   await click(page, '#tabs [data-tab=session]');
   await until(() => visible(page, '#sv-end'), 'end button');
   await page.evaluate(() => { window.confirm = () => true; }); // CDP dialog handling is also unreliable with the fake camera
+  await click(page, '#sv-end');
+  await until(() => visible(page, '#sess-start'), 'ended');
+
+  console.log('7b. "turn on cue" liveness + display toggles');
+  await setOpt(page, '#opt-live', 'challenge');
+  await startSession(page, 'Math 1B2');
+  await setOpt(page, '#opt-guide', true);
+  const cue = await until(async () => { const h = await text(page, '#kiosk-hint'); return /Turn your head [←→]/.test(h) && h; }, 'turn-on-cue prompt', 20000);
+  check(true, `"turn on cue" mode shows a random direction: "${cue}"`);
+  check(!(await page.$eval('#guide', (e) => e.hidden)), 'position guide can be switched on');
+  if (process.env.E2E_SHOTS) await page.$('#scan-box').then((e) => e.screenshot({ path: `${process.env.E2E_SHOTS}/challenge.png` }));
+  await setOpt(page, '#opt-box', false);
+  await new Promise((r) => setTimeout(r, 500));
+  check(await page.$eval('#face-canvas', (c) => { const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; return !d.some((v) => v); }), 'face box can be switched off');
+  await click(page, '#b-kiosk');
+  await click(page, '#tabs [data-tab=session]');
+  await until(() => visible(page, '#sv-end'), 'end button');
   await click(page, '#sv-end');
   await until(() => visible(page, '#sess-start'), 'ended');
   await browser.close();
@@ -160,6 +181,7 @@ try {
   await startSession(page, 'Math 1C');
   await until(async () => (await text(page, '#result-name')) === 'Not recognised', 'stranger rejected');
   check((await present(page)) === '0' && (await visible(page, '#result-pick')), '"Not recognised" with a manual-pick fallback');
+  if (process.env.E2E_SHOTS) await page.$('#scan-box').then((e) => e.screenshot({ path: `${process.env.E2E_SHOTS}/stranger.png` }));
   console.log('OK in', ((Date.now() - t0) / 1000).toFixed(1), 's');
 } catch (e) {
   console.log('FAIL', e.message);

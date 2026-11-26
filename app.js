@@ -158,7 +158,11 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
   const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
   const validThumb = (t) => typeof t === 'string' && /^data:image\/jpeg;base64,/.test(t) && t.length < 40_000;
   const faceOf = (row) => (row.face_data ? cipher.decrypt(row.face_data) : { descriptors: [], thumbnail: null });
-  const publicStudent = (row) => { const f = faceOf(row); return { id: row.id, name: row.name, hasFace: f.descriptors.length > 0, descriptors: f.descriptors, thumbnail: f.thumbnail }; };
+  // descriptors = enrolment samples + samples learned from confident scans (kept apart, capped, never replace the enrolment).
+  const publicStudent = (row) => {
+    const f = faceOf(row);
+    return { id: row.id, name: row.name, hasFace: f.descriptors.length > 0, descriptors: [...f.descriptors, ...(f.learned ?? []).map((l) => l.descriptor)], thumbnail: f.thumbnail };
+  };
 
   app.get('/api/students', auth, (req, res) => {
     const rows = db.prepare('SELECT * FROM students WHERE teacher_id=? ORDER BY name COLLATE NOCASE').all(req.user.id);
@@ -194,6 +198,33 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
     if (error) return res.status(400).json({ error });
     db.prepare('UPDATE students SET face_data=?, consent_at=? WHERE id=?').run(cipher.encrypt(face), Date.now(), req.params.id);
     res.json({ student: publicStudent(ownStudent(req)) });
+  });
+
+  // Template update (Face ID-style): the kiosk adds one fused descriptor per student per session after a confident match
+  // or a teacher-confirmed near miss. Capped FIFO pool; must stay near the original enrolment so it can't drift to someone else.
+  const LEARNED_MAX = 5, LEARNED_MAX_DIST = 0.6;
+  app.post('/api/students/:id/face/learned', auth, (req, res) => {
+    const row = ownStudent(req);
+    if (!row) return res.status(404).json({ error: 'Student not found.' });
+    const f = faceOf(row), { descriptor, sessionId } = req.body || {};
+    if (!f.descriptors.length) return res.status(409).json({ error: 'Student has no face data.' });
+    if (!validDescriptor(descriptor)) return res.status(400).json({ error: 'Invalid face data.' });
+    const s = db.prepare('SELECT * FROM class_sessions WHERE id=? AND teacher_id=? AND ended_at IS NULL').get(sessionId, req.user.id);
+    if (!s) return res.status(409).json({ error: 'No active session.' });
+    if (Math.min(...f.descriptors.map((d) => dist(descriptor, d))) > LEARNED_MAX_DIST) return res.status(422).json({ error: 'Too far from the enrolled face.' });
+    const learned = [...(f.learned ?? []).filter((l) => l.sessionId !== s.id), { descriptor, sessionId: s.id, at: Date.now() }].slice(-LEARNED_MAX);
+    db.prepare('UPDATE students SET face_data=? WHERE id=?').run(cipher.encrypt({ ...f, learned }), row.id);
+    res.json({ learned: learned.length });
+  });
+  app.delete('/api/students/:id/face/learned/:sessionId', auth, (req, res) => {
+    const row = ownStudent(req);
+    if (!row) return res.status(404).json({ error: 'Student not found.' });
+    const f = faceOf(row);
+    if (f.learned?.length) {
+      const learned = f.learned.filter((l) => String(l.sessionId) !== req.params.sessionId);
+      db.prepare('UPDATE students SET face_data=? WHERE id=?').run(cipher.encrypt({ ...f, learned }), row.id);
+    }
+    res.json({ ok: true });
   });
 
   // Withdraw biometric consent: erase face data but keep the student on the roster (manual attendance only).

@@ -48,8 +48,8 @@
       <div class="kiosk" id="scan-main">
         <div class="scan big" id="scan-box">
           <video id="kiosk-video" class="cam" playsinline muted></video>
-          <canvas id="dbg-canvas" class="cam" hidden></canvas>
-          <div class="guide" id="guide"></div>
+          <canvas id="face-canvas" class="cam overlay"></canvas>
+          <div class="guide" id="guide" hidden></div>
           <pre id="dbg-text" class="dbg" hidden></pre>
           <div id="result" class="result" hidden>
             <img id="result-img" alt="">
@@ -66,11 +66,21 @@
           <button id="b-manual">Mark manually…</button>
           <button id="b-flip">Switch camera</button>
           <button id="b-kiosk" class="primary">Pause</button>
+          <div class="opts">
+            <label class="check"><input type="checkbox" id="opt-box" checked> Show face box</label>
+            <label class="check"><input type="checkbox" id="opt-guide"> Show position guide</label>
+            <label>Liveness check
+              <select id="opt-live">
+                <option value="passive" selected>Blink or head turn (fast)</option>
+                <option value="spot">+ random "turn on cue" spot checks</option>
+                <option value="challenge">"Turn on cue" for every student (strongest, slower)</option>
+                <option value="off">Off (fastest, photos can pass)</option>
+              </select></label>
+          </div>
           <label class="check"><input type="checkbox" id="dbg-toggle"> Debug overlay</label>
           <div id="dbg-panel" hidden>
             <label>Match threshold: <strong id="dbg-thr-val"></strong>
               <input type="range" id="dbg-thr" min="0.30" max="0.70" step="0.01"></label>
-            <label class="check"><input type="checkbox" id="dbg-live" checked> Require blink / head turn</label>
           </div>
         </aside>
       </div>
@@ -125,6 +135,8 @@
         <aside class="side">
           <h3>Roster (<span id="s-count">0</span>)</h3>
           <ul id="s-list" class="roster"></ul>
+          <button id="b-roster-check" type="button">Check roster (look-alikes &amp; threshold)</button>
+          <pre id="roster-report" class="report" hidden></pre>
         </aside>
       </div>
     </div>
