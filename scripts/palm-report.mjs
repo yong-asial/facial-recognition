@@ -4,6 +4,7 @@
 //   node scripts/palm-report.mjs palm-samples.json --sweep            # try several Gabor settings (implies --reencode)
 //   --wavelength 12 (with --reencode): one Gabor bank scaled to that wavelength
 //   --frames 2: also replay scans as 2 fused frames (PalmTrack's mean-score fusion)
+//   --min-sharpness 8 / --max-sharpness 15: only samples in that ROI sharpness range (from palm-eval-11k --keep-blurry)
 //   options: --same-session (count same-session genuine pairs too)  --threshold 0.38  --geom 0.5  --shift 3
 import fs from 'node:fs';
 import sharp from 'sharp';
@@ -17,7 +18,8 @@ const flag = (n) => args.includes(`--${n}`);
 const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number(args[i + 1]) : d; };
 if (!file) { console.error('usage: node scripts/palm-report.mjs <export.json> [--reencode] [--sweep] [--same-session] [--threshold t] [--geom w] [--shift s]'); process.exit(1); }
 
-const raw = JSON.parse(fs.readFileSync(file, 'utf8')).samples;
+const minSharp = num('min-sharpness', -Infinity), maxSharp = num('max-sharpness', Infinity);
+const raw = JSON.parse(fs.readFileSync(file, 'utf8')).samples.filter((x) => !Number.isFinite(x.sharpness) || (x.sharpness >= minSharp && x.sharpness < maxSharp));
 const crossSession = !flag('same-session'), threshold = num('threshold', 0.38), frames = num('frames', 1), geomWeight = num('geom', 0), maxShift = num('shift', 3);
 const people = new Set(raw.map((s) => s.person)), sessions = new Set(raw.map((s) => s.session));
 console.log(`${raw.length} samples, ${people.size} people, ${sessions.size} sessions; genuine pairs: ${crossSession ? 'different sessions only' : 'all'}`);

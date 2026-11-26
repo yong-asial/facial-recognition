@@ -127,7 +127,7 @@ Contactless palmprint on a webcam/iPad camera is less accurate than published nu
 npm run models       # once: downloads MediaPipe hand_landmarker.task (~7.5 MB) into ./models (gitignored)
 npm start            # then open http://localhost:3009/palm-spike.html (no login)
 npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.38] [--wavelength 14] [--frames 3] [--geom 0.5]
-node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--per 8] [--webcam]   # public dataset run, see below
+node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--per 8] [--webcam] [--blur 2] [--keep-blurry]   # public dataset run, see below
 ```
 
 | Step | Where | Notes |
@@ -153,6 +153,8 @@ node scripts/palm-eval-11k.mjs HandInfo.csv Hands/ out.json [--subjects 60] [--p
 | hand geometry alone | EER 30% (useless; kept at weight 0) | EER 30% |
 
 Frame fusion (webcam-like, threshold 0.38, enrol/scan halves): 1 frame **92.2%** right · 2 frames **95.1%** · 3 frames **98.6%**, always 0 wrong; an unenrolled person was given a name 0 of 140 (2 frames) / 0 of 75 (3 frames) times, and 0 of 296 single frames even at threshold 0.40. Guarded vote beat a plain mean (95.7% at 3 frames) and best-frame-only (97.1%) with the same 0 errors. `npm run palm:report -- export.json --frames 3` reproduces it.
+
+Blur (640×480 with added Gaussian blur, all frames kept): accuracy does not drop down to ROI sharpness ~3 (σ=3: 98.9% right with 3 frames, 0 wrong, 0 unenrolled named), because the λ=14 code ignores fine wrinkles; below ~3 (σ=4–6) palms start to look alike and 3–5 of ~100 unenrolled scans get a name. Sharpness limits are therefore 4 (scan) / 5 (enrolment), not the first-guess 8 / 15 that rejected most frames of a soft webcam ("The image was too blurry"). If enrolment still fails on sharpness, the message shows the sharpest value seen vs the limit.
 
 Wavelength sweep (EER, webcam-like): λ=10 4.1%, 12 ~3.5%, **14 2.7%**, 16 2.7% (but fewer right at a safe threshold), 18 2.7%. Coarser filters follow principal lines, which stay put when the hand pose changes; fine wrinkles move. Resolution is not the limit (640×480 ≈ full res); ROI alignment between poses is.
 Caveats: each person's photos come from one sitting (no day-to-day change; optimistic), but every photo is an independent pose with no tracking (pessimistic). The margin is thin: the closest different-person pair is only ~0.02 above the threshold.

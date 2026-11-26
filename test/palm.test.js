@@ -64,6 +64,14 @@ test('fingersOpen: open hand vs curled fingers', () => {
   assert.equal(fingersOpen(rightPalm({ curl: true })), 0);
 });
 
+test('palmQuality: sharpness limits follow the blur measurement (4 scan / 5 enrol), not the old 8 / 15', () => {
+  const good = { facing: true, flatness: 0.95, open: 4, side: 180, inFrame: true, brightness: 120, score: 0.95 };
+  assert.equal(palmQuality({ ...good, sharpness: 6 }, ENROLL_PALM).ok, true, 'a soft webcam frame can enrol');
+  assert.equal(palmQuality({ ...good, sharpness: 4.5 }, ENROLL_PALM).reason, 'blur');
+  assert.equal(palmQuality({ ...good, sharpness: 4.5 }, SCAN_PALM).ok, true);
+  assert.equal(palmQuality({ ...good, sharpness: 3 }, SCAN_PALM).reason, 'blur', 'below ~3 unenrolled palms start to match');
+});
+
 test('palmQuality: first problem wins, scan is more lenient than enrolment', () => {
   const good = { facing: true, flatness: 0.95, open: 4, side: 180, inFrame: true, sharpness: 40, brightness: 120, score: 0.95 };
   assert.deepEqual(palmQuality(good, ENROLL_PALM), { ok: true });

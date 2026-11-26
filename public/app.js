@@ -713,7 +713,7 @@ $('#b-capture-palm').onclick = async () => {
  *  @param {HTMLVideoElement} video @param {'Left' | 'Right'} hand @param {number} run */
 async function capturePalm(video, hand, run) {
   const samples = [], deadline = Date.now() + 40000, rejects = {}, side = hand.toLowerCase(), other = hand === 'Right' ? 'left' : 'right';
-  let lastAt = 0, lastTime = -1;
+  let lastAt = 0, lastTime = -1, sharpest = 0; // best sharpness seen on blur-rejected frames, reported if it fails
   hint('#enroll-hint', `Show your ${side} palm, fingers apart, about 30 cm from the camera`);
   while (samples.length < PALM_ENROLL_SAMPLES && Date.now() < deadline) {
     if (run !== loopRun) return null;
@@ -725,7 +725,11 @@ async function capturePalm(video, hand, run) {
     if (frames.length > 1) { hint('#enroll-hint', 'One hand at a time', 'warn'); continue; }
     if (!f) { hint('#enroll-hint', `That is the ${other} hand — show your ${side} palm`, 'warn'); continue; }
     const q = palmQuality(f.signals, ENROLL_PALM);
-    if (!q.ok) { rejects[q.reason] = (rejects[q.reason] ?? 0) + 1; hint('#enroll-hint', q.hint, 'warn'); continue; }
+    if (!q.ok) {
+      rejects[q.reason] = (rejects[q.reason] ?? 0) + 1;
+      if (q.reason === 'blur') sharpest = Math.max(sharpest, f.signals.sharpness);
+      hint('#enroll-hint', q.hint, 'warn'); continue;
+    }
     if (samples.length && hamming(f.code, samples[0].code, palmMatcher.maxShift) > 0.42) { hint('#enroll-hint', 'Hand changed — keep the same hand in view', 'warn'); continue; }
     if (Date.now() - lastAt < 400) continue; // a little variety between samples
     samples.push({ hand, code: f.code, geom: [] }); lastAt = Date.now();
@@ -733,7 +737,7 @@ async function capturePalm(video, hand, run) {
   }
   if (samples.length < PALM_ENROLL_SAMPLES) {
     const worst = Object.entries(rejects).sort((a, b) => b[1] - a[1])[0]?.[0];
-    const why = { blur: 'The image was too blurry (hold still)', dark: 'It was too dark', bright: 'It was too bright', small: 'The hand was too far away', tilt: 'The palm was not flat to the camera', closed: 'The fingers were not open', back: 'The back of the hand was shown', frame: 'The hand was partly out of view' }[worst];
+    const why = { blur: `The image was not sharp enough (sharpest ${sharpest.toFixed(1)}, needs ${ENROLL_PALM.minSharpness}): add light on the hand and hold it still about 30 cm from the camera`, dark: 'It was too dark', bright: 'It was too bright', small: 'The hand was too far away', tilt: 'The palm was not flat to the camera', closed: 'The fingers were not open', back: 'The back of the hand was shown', frame: 'The hand was partly out of view' }[worst];
     throw new Error((why ? why + '. ' : `Could not capture a clear ${side} palm. `) + 'Improve lighting / position and try again.');
   }
   return prunePalmOutliers(samples, palmMatcher, { keep: 4 });

@@ -81,10 +81,15 @@ export function fingersOpen(pts) {
 /** @typedef {{facing: boolean, flatness: number, open: number, side: number, inFrame: boolean, sharpness: number, brightness: number, score: number}} PalmSignals */
 /** @typedef {{minFlatness: number, minOpen: number, minSide: number, minSharpness: number, minBrightness: number, maxBrightness: number, minScore: number}} PalmLimits */
 
+// Sharpness (Laplacian variance of the 128 px ROI) mostly measures fine wrinkles, which the wavelength-14 code ignores.
+// Measured on 11K Hands at 640x480 with added blur (palm-eval-11k --blur, --keep-blurry): accuracy is unchanged down to
+// sharpness ~3 (blur sigma 3: 98.9% right with 3 frames, 0 wrong, 0 unenrolled named), but below ~3 (sigma 4-6) palms
+// start to look alike and unenrolled people get names (3-5 of ~100). So the limit guards against false accepts, with a
+// margin: 4 at scan, 5 at enrolment. The old limits (8 / 15) rejected most frames of a soft webcam for no gain.
 /** Scan: lenient, a bad frame is just skipped (the next is ~30 ms away). */
-export const SCAN_PALM = /** @type {PalmLimits} */ ({ minFlatness: 0.8, minOpen: 3, minSide: 96, minSharpness: 8, minBrightness: 40, maxBrightness: 235, minScore: 0.6 });
+export const SCAN_PALM = /** @type {PalmLimits} */ ({ minFlatness: 0.8, minOpen: 3, minSide: 96, minSharpness: 4, minBrightness: 40, maxBrightness: 235, minScore: 0.6 });
 /** Enrolment: strict. A bad template hurts every later scan. */
-export const ENROLL_PALM = /** @type {PalmLimits} */ ({ minFlatness: 0.9, minOpen: 4, minSide: 140, minSharpness: 15, minBrightness: 60, maxBrightness: 215, minScore: 0.8 });
+export const ENROLL_PALM = /** @type {PalmLimits} */ ({ minFlatness: 0.9, minOpen: 4, minSide: 140, minSharpness: 5, minBrightness: 60, maxBrightness: 215, minScore: 0.8 });
 
 /** First problem with a short instruction, like faceQuality(). @param {PalmSignals} s @param {PalmLimits} q
  *  @returns {{ok: true} | {ok: false, reason: string, hint: string}} */
@@ -96,7 +101,7 @@ export function palmQuality(s, q) {
   if (s.flatness < q.minFlatness) return { ok: false, reason: 'tilt', hint: 'Hold your palm flat to the camera' };
   if (s.brightness < q.minBrightness) return { ok: false, reason: 'dark', hint: 'Too dark — face the light' };
   if (s.brightness > q.maxBrightness) return { ok: false, reason: 'bright', hint: 'Too bright — avoid direct light' };
-  if (s.sharpness < q.minSharpness) return { ok: false, reason: 'blur', hint: 'Hold still for a moment' };
+  if (s.sharpness < q.minSharpness) return { ok: false, reason: 'blur', hint: 'Not sharp — hold still, with more light on your hand' };
   if (s.score < q.minScore) return { ok: false, reason: 'score', hint: 'Show your open palm' };
   return { ok: true };
 }
