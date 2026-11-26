@@ -3,7 +3,7 @@ import { FaceService } from './face-service.js';
 import { AttendanceService } from './attendance-service.js';
 import { MatchingService, FaceTracker, iou, faceQuality, SCAN_QUALITY, ENROLL_QUALITY, meanDescriptor, pruneOutliers, rosterReport, euclidean } from './matching.js';
 import { PalmService } from './palm-service.js';
-import { PalmMatcher, PalmTrack, palmQuality, SCAN_PALM, ENROLL_PALM, prunePalmOutliers, palmDuplicate, hamming, codeToBase64, codeFromBase64 } from './palm.js';
+import { PalmMatcher, PalmTrack, palmQuality, SCAN_PALM, ENROLL_PALM, prunePalmOutliers, palmDuplicate, hamming, codeToBase64, codeFromBase64, PALM_TEMPLATE_VERSION } from './palm.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,7 +22,8 @@ const SPOT_RATE = 0.2;          // liveness "spot": share of check-ins that also
 const CHALLENGE_TRIES = 2;      // failed/timed-out cues before "Not verified"
 const PALM_CONFIRM_FRAMES = 2;  // palm: good frames before deciding (guarded vote, see fuseDecide; 1 if very close)
 const PALM_ENROLL_SAMPLES = 6;  // palm: captured per hand through the strict gate; outliers pruned before saving
-const PALM_PROMPTS = ['Hold still', 'Spread your fingers a little', 'Move a little closer', 'Tilt your hand slightly', 'Back to flat', 'Relax your hand'];
+// Both finger poses end up in the template (gaps or no gaps both match later; the mean of the 2 nearest samples is used).
+const PALM_PROMPTS = ['Fingers together', 'Hold still', 'Now leave small gaps between the fingers', 'Hold still', 'Move a little closer', 'Relax your hand'];
 
 // ---------- kiosk options (per browser) ----------
 const OPTS = { 'opt-method': 'value', 'opt-box': 'checked', 'opt-guide': 'checked', 'opt-live': 'value' };
@@ -55,7 +56,9 @@ const matcher = new MatchingService({ threshold: 0.5, gap: 0.04, ratio: 0.8, k: 
 const palm = new PalmService({ tf: window.faceapi?.tf });
 const palmMatcher = new PalmMatcher();
 let palmRoster = [];               // students with palm data, codes decoded: [{id, name, palms: [{hand, code, geom}]}]
-const toPalmEnrolled = (s) => ({ id: s.id, name: s.name, palms: (s.palms ?? []).map((p) => ({ hand: p.hand, code: codeFromBase64(p.code), geom: [] })) });
+// Only templates of the current version: older ones were cut out differently (see PALM_TEMPLATE_VERSION) and would not match.
+const currentPalms = (s) => (s.palms ?? []).filter((p) => (p.v ?? 1) === PALM_TEMPLATE_VERSION);
+const toPalmEnrolled = (s) => ({ id: s.id, name: s.name, palms: currentPalms(s).map((p) => ({ hand: p.hand, code: codeFromBase64(p.code), geom: [] })) });
 const attendance = new AttendanceService({
   send: (sessionId, studentId, scannedAt, method) => Api.markPresent(sessionId, studentId, scannedAt, method),
   storage: safe(() => localStorage) ?? undefined,
@@ -76,6 +79,26 @@ let lastFace = null;              // {descriptor, at}: last fused face that was 
 function msg(text = '', ok = false) { const m = $('#msg'); m.textContent = text; m.className = 'msg' + (ok ? ' ok' : ''); }
 function hint(sel, text, kind = '') { const el = $(sel); el.textContent = text; el.className = 'hint ' + kind; }
 const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+
+// ---------- position guide: an oval for faces, an open-hand outline for palms ----------
+// The hand is drawn as a silhouette (a dashed outline masked so finger/palm overlaps don't show), thumb on the left:
+// how a right palm looks in the mirrored front-camera preview. palmGuide() flips it for the left hand / rear camera.
+let guideSeq = 0;
+function handSvg() {
+  const id = `hand-guide-${++guideSeq}`;
+  return `<svg class="hand" viewBox="0 0 100 140" aria-hidden="true"><defs><g id="${id}">
+    <rect x="28" y="62" width="52" height="58" rx="15"/><rect x="37" y="108" width="34" height="40" rx="8"/>
+    <rect x="27" y="26" width="10" height="46" rx="5" transform="rotate(-10 32 70)"/>
+    <rect x="40.5" y="13" width="10" height="57" rx="5" transform="rotate(-3 45.5 70)"/>
+    <rect x="54" y="18" width="10" height="52" rx="5" transform="rotate(4 59 70)"/>
+    <rect x="67" y="34" width="9.5" height="39" rx="4.75" transform="rotate(13 71.75 73)"/>
+    <rect x="23.5" y="58" width="13" height="46" rx="6.5" transform="rotate(-38 30 104)"/>
+  </g><mask id="${id}-m"><rect width="100" height="140" fill="#fff"/><use href="#${id}" fill="#000"/></mask></defs>
+  <use href="#${id}" fill="none" stroke="currentColor" stroke-width="4" stroke-dasharray="6 4" mask="url(#${id}-m)"/></svg>`;
+}
+for (const g of document.querySelectorAll('.guide')) g.insertAdjacentHTML('beforeend', handSvg());
+/** Class list for a palm guide. @param {'Left' | 'Right'} hand @param {string} [state] ok | warn | bad | '' */
+const palmGuide = (hand, state = '') => `guide palm${(hand === 'Right') === (facing === 'user') ? '' : ' flip'} ${state}`;
 
 // ---------- camera / wake lock ----------
 async function startCamera(video) {
@@ -166,8 +189,10 @@ async function startScan() {
   renderCount(); renderQueue(attendance.pending());
   if (!students.length) return hint('#kiosk-hint', 'No students yet — add them in the Students tab.', 'warn');
   if (palmMode) {
-    palmRoster = students.filter((s) => s.hasPalm).map(toPalmEnrolled);
-    if (!palmRoster.length) return hint('#kiosk-hint', 'No enrolled palms yet. Enrol palms in the Students tab, switch "Scan with" to Face, or use "Mark manually".', 'warn');
+    palmRoster = students.filter((s) => currentPalms(s).length).map(toPalmEnrolled);
+    if (!palmRoster.length) return hint('#kiosk-hint', students.some((s) => s.hasPalm)
+      ? 'Palms were enrolled with an older version: re-enrol them in the Students tab (or use "Mark manually").'
+      : 'No enrolled palms yet. Enrol palms in the Students tab, switch "Scan with" to Face, or use "Mark manually".', 'warn');
   } else if (!students.some((s) => s.hasFace)) return hint('#kiosk-hint', 'No enrolled faces yet. Use "Mark manually" or enrol faces.', 'warn');
   try { await startCamera(video); } catch (e) { return hint('#kiosk-hint', cameraError(e), 'bad'); }
   if (!alive()) return;
@@ -274,6 +299,7 @@ async function palmScanLoop(alive, video) {
   cooldown.clear(); lastFace = null;
   const guide = $('#guide');
   const hands = new Set(palmRoster.flatMap((s) => s.palms.map((p) => p.hand))); // hands anyone has enrolled
+  const guideHand = hands.has('Right') ? 'Right' : 'Left';
   let unknownStreak = 0, unknownUntil = 0, fps = 0, last = performance.now(), lastTime = -1;
 
   while (alive()) {
@@ -338,7 +364,7 @@ async function palmScanLoop(alive, video) {
       }
     } else unknownStreak = 0;
     if (!frames.length) status = ['Ready — show your open palm to the camera', ''];
-    guide.className = 'guide ' + (status?.[1] ?? (frames.length ? 'ok' : ''));
+    guide.className = palmGuide(guideHand, status?.[1] ?? (frames.length ? 'ok' : ''));
     if (status) hint('#kiosk-hint', status[0], status[1]);
 
     const nowP = performance.now(); fps = fps * 0.8 + (1000 / (nowP - last)) * 0.2; last = nowP;
@@ -622,7 +648,12 @@ async function loadRoster() {
     if (s.thumbnail) who.append(el('img', { src: s.thumbnail, alt: '' }));
     who.append(el('span', { textContent: s.name }));
     if (!s.hasFace) who.append(el('span', { className: 'tag', textContent: '  no face data' }));
-    if (s.hasPalm) who.append(el('span', { className: 'tag palm', textContent: `  palm: ${[...new Set(s.palms.map((p) => p.hand.toLowerCase()))].join(' + ')}` }));
+    if (s.hasPalm) {
+      const cur = currentPalms(s), hands = (list) => [...new Set(list.map((p) => p.hand.toLowerCase()))].join(' + ');
+      who.append(cur.length === s.palms.length
+        ? el('span', { className: 'tag palm', textContent: `  palm: ${hands(cur)}` })
+        : el('span', { className: 'tag', textContent: `  palm: ${hands(s.palms)} — re-enrol (older format)` }));
+    }
     ul.append(el('li', {}, who, actions));
   }
 }
@@ -689,7 +720,7 @@ $('#b-capture-palm').onclick = async () => {
     hint('#enroll-hint', 'Loading the hand model…');
     await palm.load();
     const choice = $('#palm-hands').value, hands = choice === 'Both' ? ['Right', 'Left'] : [choice];
-    const others = students.filter((s) => s.id !== enrollTarget?.id && s.hasPalm).map(toPalmEnrolled);
+    const others = students.filter((s) => s.id !== enrollTarget?.id && currentPalms(s).length).map(toPalmEnrolled);
     const templates = [];
     for (const hand of hands) {
       const kept = await capturePalm(video, hand, run);
@@ -699,14 +730,14 @@ $('#b-capture-palm').onclick = async () => {
       if (dup && !confirm(`This ${hand.toLowerCase()} palm looks like ${dup.student.name}'s, who is already enrolled. Save anyway? (Only if you are sure it is a different person.)`)) {
         return hint('#enroll-hint', 'Not saved (possible duplicate).', 'warn');
       }
-      templates.push(...kept.map((k) => ({ hand, code: codeToBase64(k.code) })));
+      templates.push(...kept.map((k) => ({ hand, code: codeToBase64(k.code), v: PALM_TEMPLATE_VERSION })));
     }
     if (enrollTarget) await Api.enrollPalm(enrollTarget.id, templates); else await Api.addPalmStudent(name, templates);
     const done = enrollTarget?.name ?? name;
     $('#b-cancel-re').onclick(); form.reset();
     await loadRoster();
     hint('#enroll-hint', `Saved ${done}'s palm (${hands.join(' + ').toLowerCase()}). Next student?`, 'ok');
-  } catch (err) { msg(err.message); } finally { btn.disabled = false; $('#b-capture').disabled = false; }
+  } catch (err) { msg(err.message); } finally { btn.disabled = false; $('#b-capture').disabled = false; $('#enroll-wrap .guide').className = 'guide'; }
 };
 
 /** Collect PALM_ENROLL_SAMPLES good frames of one hand, spread over time, then drop outliers. Null if the tab was left.
@@ -714,14 +745,15 @@ $('#b-capture-palm').onclick = async () => {
 async function capturePalm(video, hand, run) {
   const samples = [], deadline = Date.now() + 40000, rejects = {}, side = hand.toLowerCase(), other = hand === 'Right' ? 'left' : 'right';
   let lastAt = 0, lastTime = -1, sharpest = 0; // best sharpness seen on blur-rejected frames, reported if it fails
-  hint('#enroll-hint', `Show your ${side} palm, fingers apart, about 30 cm from the camera`);
+  $('#enroll-wrap .guide').className = palmGuide(hand);
+  hint('#enroll-hint', `Show your ${side} palm, fingers straight, about 30 cm from the camera`);
   while (samples.length < PALM_ENROLL_SAMPLES && Date.now() < deadline) {
     if (run !== loopRun) return null;
     await sleep(15);
     if (video.currentTime === lastTime) continue;
     lastTime = video.currentTime;
     const frames = palm.analyze(video), f = frames.find((x) => x.hand === hand);
-    if (!frames.length) { hint('#enroll-hint', `Show your ${side} palm, fingers apart`, 'warn'); continue; }
+    if (!frames.length) { hint('#enroll-hint', `Show your ${side} palm, fingers straight`, 'warn'); continue; }
     if (frames.length > 1) { hint('#enroll-hint', 'One hand at a time', 'warn'); continue; }
     if (!f) { hint('#enroll-hint', `That is the ${other} hand — show your ${side} palm`, 'warn'); continue; }
     const q = palmQuality(f.signals, ENROLL_PALM);

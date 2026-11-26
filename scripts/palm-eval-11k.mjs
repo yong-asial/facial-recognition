@@ -1,8 +1,10 @@
 // Run the palm pipeline (real Chrome + MediaPipe + palm-service.js) over the public 11K Hands dataset
 // (Afifi 2019, https://sites.google.com/view/11khands, academic use) and write a spike export for scripts/palm-report.mjs.
-//   node scripts/palm-eval-11k.mjs <HandInfo.csv> <Hands dir> <out.json> [--subjects 60] [--per 6] [--webcam] [--blur 1.5] [--keep-blurry]
+//   node scripts/palm-eval-11k.mjs <HandInfo.csv> <Hands dir> <out.json> [--subjects 60] [--per 6] [--webcam] [--blur 1.5] [--keep-blurry] [--roi-knuckles]
 // --webcam: shrink each 1600x1200 photo to 640x480 and JPEG it at q70 first (palm ~200 px, like a kiosk camera).
 // --blur s: Gaussian blur (sigma s, in output pixels) after shrinking: a soft webcam / slight motion.
+// --roi-knuckles: place the palm square on the index-pinky knuckle line (ROI_KNUCKLES, template v1) instead of the
+//   default middle-finger axis, for comparisons.
 // --keep-blurry: also keep frames that fail the scan gate only on sharpness (each sample stores `sharpness`), so
 //   palm-report --min-sharpness can show how accuracy depends on it.
 // Each subject's palm photos of one hand are split in half: first half "enrol", second half "scan" (report genuine pairs
@@ -16,6 +18,7 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const [csvFile, dir, outFile] = args.filter((a) => !a.startsWith('--') && !/^\d+$/.test(a));
 const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number(args[i + 1]) : d; };
+const roiKnuckles = args.includes('--roi-knuckles');
 const webcam = args.includes('--webcam'), maxSubjects = num('subjects', 60), per = num('per', 6), blur = num('blur', 0), keepBlurry = args.includes('--keep-blurry');
 if (!outFile) { console.error('usage: node scripts/palm-eval-11k.mjs <HandInfo.csv> <Hands dir> <out.json> [--subjects n] [--per n] [--webcam]'); process.exit(1); }
 
@@ -50,11 +53,12 @@ try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('PAGE ERROR', e.message));
   await page.goto(`http://localhost:${PORT}/`);
-  await page.evaluate(async () => {
+  await page.evaluate(async (roiKnuckles) => {
     const { PalmService } = await import('/palm-service.js');
-    const palm = new PalmService({ tf: window.faceapi?.tf, mode: 'IMAGE' });
+    const { ROI_KNUCKLES } = await import('/palm.js');
+    const palm = new PalmService({ tf: window.faceapi?.tf, mode: 'IMAGE', roiShape: roiKnuckles ? ROI_KNUCKLES : undefined });
     await palm.load();
-    const { codeToBase64, palmQuality, SCAN_PALM, ENROLL_PALM } = await import('/palm.js');
+    const { codeToBase64, palmQuality, SCAN_PALM, ENROLL_PALM, fingerSpread } = await import('/palm.js');
     const canvas = document.createElement('canvas'), out = document.createElement('canvas');
     out.width = out.height = 128;
     window.run = async (b64) => {
@@ -66,10 +70,10 @@ try {
       if (!f) return { found: false, ms };
       const ctx = out.getContext('2d'), id = ctx.createImageData(128, 128);
       f.gray.forEach((v, i) => id.data.set([v, v, v, 255], i * 4)); ctx.putImageData(id, 0, 0);
-      return { found: true, ms, hand: f.hand, signals: f.signals, scan: palmQuality(f.signals, SCAN_PALM), enrol: palmQuality(f.signals, ENROLL_PALM),
+      return { found: true, ms, hand: f.hand, spread: fingerSpread(f.pts), signals: f.signals, scan: palmQuality(f.signals, SCAN_PALM), enrol: palmQuality(f.signals, ENROLL_PALM),
         code: codeToBase64(f.code), geom: f.geom, roi: out.toDataURL('image/jpeg', 0.92) };
     };
-  });
+  }, roiKnuckles);
 
   const samples = [], stats = { found: 0, handOk: 0, facing: 0, scanOk: 0, enrolOk: 0, scanWhy: {}, ms: [] };
   for (const [i, j] of jobs.entries()) {
@@ -87,7 +91,7 @@ try {
     if (r.enrol.ok) stats.enrolOk++;
     // The kiosk only keeps frames that pass the scan gate, and only compares templates of the detected hand.
     if (r.scan.ok || (keepBlurry && r.scan.reason === 'blur'))
-      samples.push({ person: j.person, hand: r.hand, session: j.session, gate: r.enrol.ok ? 'strict' : 'lenient', sharpness: r.signals.sharpness, code: r.code, geom: r.geom, roi: r.roi, at: 0 });
+      samples.push({ person: j.person, hand: r.hand, session: j.session, gate: r.enrol.ok ? 'strict' : 'lenient', sharpness: r.signals.sharpness, spread: r.spread, file: path.basename(j.file), code: r.code, geom: r.geom, roi: r.roi, at: 0 });
     if ((i + 1) % 100 === 0) console.log(`  ${i + 1}/${jobs.length}`);
   }
   const n = jobs.length, p = (x) => `${((x / n) * 100).toFixed(1)}%`;

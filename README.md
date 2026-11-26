@@ -7,7 +7,7 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (101)
+npm test             # unit + API tests (104)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
 node scripts/e2e-palm.mjs palmA.y4m [palmB.y4m]   # palm kiosk E2E (see "Palm scanning")
 ```
@@ -120,7 +120,10 @@ ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/A.jpg -vf "$V,perspective=x0
 Check-in by showing an open palm to the same camera (target < 1 s from palm in view to "Present").
 - **Kiosk:** Scan sidebar -> **Scan with: Palm** (saved per browser; one method at a time, so only one model runs per frame). Same card, cooldown, *Wrong person*, manual picker and offline queue as faces; attendance is recorded with method `palm`. Hints: "Show the palm of your hand", "Open your hand, fingers apart", "Use your right hand" (when nobody enrolled the hand shown), "Move your fingers a little" (liveness).
 - **Liveness (same menu, palm wording):** *Finger movement* (passive: fingertips must move relative to the palm; a held photo is rigid), *+ random close & open spot checks*, *Close & open hand for every student*, *Off*. Passive thresholds are first guesses: tune them with real hands and printed palms (debug overlay shows `finger travel`).
-- **Enrolment:** Students -> *Capture palm & add student* (or *Enrol / Re-enrol palm* on a roster row), right hand by default, left or both from the menu. 6 frames per hand through the strict gate, outliers dropped, duplicate warning. A student can have face, palm or both; *Delete palm data* withdraws palms only.
+- **Enrolment:** Students -> *Capture palm & add student* (or *Enrol / Re-enrol palm* on a roster row), right hand by default, left or both from the menu. 6 frames per hand through the strict gate (prompts ask for fingers together, then with small gaps, so both poses are in the template), outliers dropped, duplicate warning. A student can have face, palm or both; *Delete palm data* withdraws palms only.
+- **Fingers:** gaps between the fingers are fine; only straight fingers are required (3 at scan, 4 at enrolment). The palm square sits on the wrist → middle-knuckle axis, which barely moves when fingers spread (on 11K Hands, same-person pairs whose spread differs by 35°+ match 84% of the time, vs 48% with the earlier knuckle-line square).
+- **Position guide:** in palm mode (kiosk *Show position guide*, and while capturing a palm) the oval becomes an open-hand outline, mirrored to the hand being enrolled / the enrolled hand.
+- **Template versions:** palm templates carry `v` (`PALM_TEMPLATE_VERSION`, now 2 = middle-finger-axis square). The kiosk ignores older templates and the roster marks them "re-enrol (older format)".
 Contactless palmprint on a webcam/iPad camera is less accurate than published numbers (lab lighting, contact scanners): check the go/no-go below with real people before relying on it.
 
 ```bash

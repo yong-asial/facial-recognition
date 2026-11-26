@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   LM, palmRoi, palmSide, palmFacing, palmFlatness, fingersOpen, palmQuality, SCAN_PALM, ENROLL_PALM, insideFrame, grayStats, toGray,
   gaborBank, GABOR, filterResponses, encodeCompCode, hammingAt, hamming, handGeometry, geometryDistance, PalmMatcher, palmReport, simulate1N, fuseScores, fuseDecide, PalmTrack, PalmLiveness, palmFrameTips, prunePalmOutliers, palmDuplicate,
-  codeToBase64, codeFromBase64, ROI_SIZE, CODE_SIDE, CODE_WORDS, ORIENTATIONS,
+  codeToBase64, codeFromBase64, ROI_SIZE, CODE_SIDE, CODE_WORDS, ORIENTATIONS, ROI_SHAPE, ROI_KNUCKLES, fingerSpread,
 } from '../public/palm.js';
 import { FaceTracker } from '../public/matching.js';
 
@@ -23,14 +23,14 @@ function rightPalm({ dx = 0, dy = 0, scale = 1, curl = false } = {}) {
 }
 const mirrorX = (pts) => pts.map((p) => ({ ...p, x: 1000 - p.x }));
 
-test('palmRoi: knuckle-line frame, towards the wrist, a rotation not a mirror', () => {
-  for (const pts of [rightPalm(), mirrorX(rightPalm())]) {
-    const r = palmRoi(pts);
+test('palmRoi: both frames point towards the wrist and are a rotation, not a mirror', () => {
+  for (const shape of [ROI_SHAPE, ROI_KNUCKLES]) for (const pts of [rightPalm(), mirrorX(rightPalm())]) {
+    const r = palmRoi(pts, ROI_SIZE, shape);
     close(r.u.x * r.n.y - r.u.y * r.n.x, 1); // det = +1
     const toWrist = { x: pts[LM.WRIST].x - r.center.x, y: pts[LM.WRIST].y - r.center.y };
     assert.ok(toWrist.x * r.n.x + toWrist.y * r.n.y > 0, 'n points at the wrist');
-    const w = Math.hypot(pts[5].x - pts[17].x, pts[5].y - pts[17].y);
-    close(r.side, w);
+    const w = shape.anchor === 'axis' ? Math.hypot(pts[0].x - pts[9].x, pts[0].y - pts[9].y) : Math.hypot(pts[5].x - pts[17].x, pts[5].y - pts[17].y);
+    close(r.side, shape.side * w);
     // The canvas transform maps the ROI centre to the middle of the output and the corners to the output corners.
     const [a, b, c, d, e, f] = r.transform, map = (p) => ({ x: a * p.x + c * p.y + e, y: b * p.x + d * p.y + f });
     const m = map(r.center); close(m.x, ROI_SIZE / 2); close(m.y, ROI_SIZE / 2);
@@ -43,6 +43,15 @@ test('palmRoi: moves and scales with the hand', () => {
   const a = palmRoi(rightPalm()), b = palmRoi(rightPalm({ dx: 30, dy: -10, scale: 1.5 }));
   close(b.side, a.side * 1.5);
   close(b.u.x, a.u.x); close(b.u.y, a.u.y);
+});
+
+test('palmRoi (default, middle-finger axis): spreading the fingers barely moves the square; the knuckle frame moves', () => {
+  // Spread: index and pinky (with their knuckles) swing outwards around the middle finger.
+  const spread = rightPalm().map((p, i) => ([5, 6, 7, 8].includes(i) ? { ...p, x: p.x + 0.25 * (600 - p.y) } : [17, 18, 19, 20].includes(i) ? { ...p, x: p.x - 0.35 * (600 - p.y), y: p.y + 12 } : p));
+  assert.ok(fingerSpread(spread) - fingerSpread(rightPalm()) > 25, `spread ${fingerSpread(rightPalm()).toFixed(0)} -> ${fingerSpread(spread).toFixed(0)}°`);
+  const moved = (shape) => { const a = palmRoi(rightPalm(), ROI_SIZE, shape), b = palmRoi(spread, ROI_SIZE, shape); return Math.max(...a.corners.map((c, i) => Math.hypot(c.x - b.corners[i].x, c.y - b.corners[i].y))) / a.side; };
+  assert.equal(moved(ROI_SHAPE), 0, 'axis frame does not depend on index/pinky');
+  assert.ok(moved(ROI_KNUCKLES) > 0.1, `knuckle frame corners move ${moved(ROI_KNUCKLES).toFixed(2)} of a side`);
 });
 
 test('palm side: palm vs back of the hand, per hand', () => {

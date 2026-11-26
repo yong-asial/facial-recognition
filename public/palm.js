@@ -22,22 +22,40 @@ const len = (/** @type {Pt} */ a) => Math.hypot(a.x, a.y);
 // ---------- ROI ----------
 /** Where on the palm the ROI sits, as fractions of the index-to-pinky knuckle distance (w).
  *  The square starts `top`·w below the knuckle line (towards the wrist) and is `side`·w wide. */
-export const ROI_SHAPE = { side: 1.0, top: 0.15 };
+/** Default frame: the middle-finger axis (wrist 0 -> middle MCP 9), sizes in units of that length (~1.5x the knuckle
+ *  width). Spreading the fingers moves the index/pinky knuckles sideways but hardly moves this axis. On the same 401
+ *  11K Hands photos it beat the knuckle-line frame: EER 2.4% vs 3.3%, and same-person pairs whose finger spread differs
+ *  by 35°+ matched 84% vs 48% of the time (scripts/palm-eval-11k.mjs [--roi-knuckles]). */
+export const ROI_SHAPE = { anchor: /** @type {'knuckles' | 'axis'} */ ('axis'), side: 0.67, top: 0.1 };
+/** Previous frame: x axis along the index-pinky knuckle line (template version 1). Kept for comparisons. */
+export const ROI_KNUCKLES = { anchor: /** @type {'knuckles' | 'axis'} */ ('knuckles'), side: 1.0, top: 0.15 };
+/** Bump when anything that changes the code for the same palm changes (ROI frame, filters): older templates are then
+ *  ignored by the kiosk and the roster asks for a re-enrol. v1 = knuckle-line ROI, v2 = middle-finger-axis ROI. */
+export const PALM_TEMPLATE_VERSION = 2;
 
 /** @typedef {{center: Pt, u: Pt, n: Pt, side: number, corners: Pt[], transform: [number, number, number, number, number, number]}} Roi */
 
-/** Palm ROI from the knuckles (index MCP 5, pinky MCP 17) and the wrist (0), the usual contactless palmprint frame:
- *  x axis along the knuckle line, y axis towards the wrist. The axis direction is picked so the crop is a rotation
+/** Palm ROI: y axis towards the wrist along the middle-finger axis (ROI_SHAPE), or x axis along the knuckle line
+ *  (ROI_KNUCKLES, the usual contactless palmprint frame). The axis direction is picked so the crop is a rotation
  *  (never a mirror image), so the palm looks the way the camera sees it whichever hand it is.
  *  `transform` is a canvas setTransform() that draws the source frame into a ROI_SIZE square.
  *  @param {Pt[]} pts landmarks in pixels @param {number} [size] @returns {Roi} */
 export function palmRoi(pts, size = ROI_SIZE, shape = ROI_SHAPE) {
   const p5 = pts[LM.INDEX_MCP], p17 = pts[LM.PINKY_MCP], p0 = pts[LM.WRIST];
-  const knuckles = sub(p17, p5), w = len(knuckles) || 1;
-  let u = { x: knuckles.x / w, y: knuckles.y / w };
-  const mid = { x: (p5.x + p17.x) / 2, y: (p5.y + p17.y) / 2 };
-  let n = { x: -u.y, y: u.x };
-  if (dot(n, sub(p0, mid)) < 0) n = { x: -n.x, y: -n.y }; // n points towards the wrist
+  let u, n, mid, w;
+  if (shape.anchor === 'axis') {
+    const p9 = pts[LM.MIDDLE_MCP], axis = sub(p0, p9);
+    w = len(axis) || 1; mid = p9;
+    n = { x: axis.x / w, y: axis.y / w }; // towards the wrist
+    u = { x: -n.y, y: n.x };
+  } else {
+    const knuckles = sub(p17, p5);
+    w = len(knuckles) || 1;
+    u = { x: knuckles.x / w, y: knuckles.y / w };
+    mid = { x: (p5.x + p17.x) / 2, y: (p5.y + p17.y) / 2 };
+    n = { x: -u.y, y: u.x };
+    if (dot(n, sub(p0, mid)) < 0) n = { x: -n.x, y: -n.y }; // n points towards the wrist
+  }
   if (u.x * n.y - u.y * n.x < 0) u = { x: -u.x, y: -u.y }; // det(u, n) = +1: a rotation, not a reflection
   const side = shape.side * w, off = (shape.top + shape.side / 2) * w;
   const center = { x: mid.x + n.x * off, y: mid.y + n.y * off };
@@ -78,6 +96,15 @@ export function fingersOpen(pts) {
   return pairs.filter(([pip, tip]) => len(sub(pts[tip], w)) > len(sub(pts[pip], w)) * 1.1).length;
 }
 
+/** How far the fingers are spread: angle in degrees between the index (5->8) and pinky (17->20) directions.
+ *  ~5-15 = fingers together, ~30-50 = relaxed gaps, 60+ = spread wide. Informational: no gate uses it.
+ *  @param {Pt[]} pts */
+export function fingerSpread(pts) {
+  const a = sub(pts[LM.INDEX_TIP], pts[LM.INDEX_MCP]), b = sub(pts[LM.PINKY_TIP], pts[LM.PINKY_MCP]);
+  const c = dot(a, b) / ((len(a) * len(b)) || 1);
+  return (Math.acos(Math.max(-1, Math.min(1, c))) * 180) / Math.PI;
+}
+
 /** @typedef {{facing: boolean, flatness: number, open: number, side: number, inFrame: boolean, sharpness: number, brightness: number, score: number}} PalmSignals */
 /** @typedef {{minFlatness: number, minOpen: number, minSide: number, minSharpness: number, minBrightness: number, maxBrightness: number, minScore: number}} PalmLimits */
 
@@ -97,7 +124,7 @@ export function palmQuality(s, q) {
   if (!s.facing) return { ok: false, reason: 'back', hint: 'Show the palm of your hand' };
   if (!s.inFrame) return { ok: false, reason: 'frame', hint: 'Move your hand to the middle' };
   if (s.side < q.minSide) return { ok: false, reason: 'small', hint: 'Bring your hand closer' };
-  if (s.open < q.minOpen) return { ok: false, reason: 'closed', hint: 'Open your hand, fingers apart' };
+  if (s.open < q.minOpen) return { ok: false, reason: 'closed', hint: 'Open your hand, fingers straight' };
   if (s.flatness < q.minFlatness) return { ok: false, reason: 'tilt', hint: 'Hold your palm flat to the camera' };
   if (s.brightness < q.minBrightness) return { ok: false, reason: 'dark', hint: 'Too dark — face the light' };
   if (s.brightness > q.maxBrightness) return { ok: false, reason: 'bright', hint: 'Too bright — avoid direct light' };

@@ -33,7 +33,7 @@ test('palm-only student: created with consent, listed with codes, no face', asyn
   const listed = (await s.call('/students', undefined, t)).body.students.find((x) => x.name === 'Palm Pat');
   assert.equal(listed.palms.length, 3);
   assert.deepEqual(codeFromBase64(listed.palms[0].code), codeFromBase64(code(1)), 'code round-trips');
-  assert.deepEqual(Object.keys(listed.palms[0]).sort(), ['code', 'hand']);
+  assert.deepEqual(Object.keys(listed.palms[0]).sort(), ['code', 'hand', 'v']);
 });
 
 test('student creation: face, palm or both; each needs consent and valid data', async () => {
@@ -53,6 +53,13 @@ test('student creation: face, palm or both; each needs consent and valid data', 
   assert.equal(both.body.student.hasFace, true); assert.equal(both.body.student.hasPalm, true);
   assert.equal((await s.call('/students', { name: 'X', consent: true, descriptors: [[1]], palm: palm('Left', 5) }, t)).status, 400, 'bad face fails the whole request');
   assert.equal((await s.call('/students', { name: 'X', consent: true, palm: palm('Left', ...Array.from({ length: 10 }, (_, i) => i)).concat(palm('Right', ...Array.from({ length: 10 }, (_, i) => i))) }, t)).status, 200, '10 per hand is fine');
+});
+
+test('palm template version: stored and returned (missing = 1), invalid values refused', async () => {
+  const r = await s.call('/students', { name: 'Ver Vi', consent: true, palm: [{ hand: 'Right', code: code(1), v: 2 }, { hand: 'Left', code: code(2) }] }, t);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.student.palms.map((p) => [p.hand, p.v]), [['Right', 2], ['Left', 1]]);
+  for (const v of [0, 1.5, '2', 100]) assert.equal((await s.call('/students', { name: 'X', consent: true, palm: [{ hand: 'Right', code: code(1), v }] }, t)).status, 400, `v=${v}`);
 });
 
 test('PUT palm: enrols a face-only student; re-enrolling one hand keeps the other', async () => {
@@ -118,6 +125,6 @@ test('palm data is encrypted at rest, and an existing database gets the palm col
   const row = new DatabaseSync(file).prepare('SELECT palm_data, palm_consent_at FROM students').get();
   assert.ok(row.palm_consent_at > 0);
   assert.ok(!row.palm_data.includes(code(42).slice(0, 24)), 'code not stored in the clear');
-  assert.deepEqual(cipher.decrypt(row.palm_data).templates, palm('Right', 42));
+  assert.deepEqual(cipher.decrypt(row.palm_data).templates, palm('Right', 42).map((t) => ({ ...t, v: 1 })));
   await new Promise((r) => server.close(r));
 });

@@ -172,7 +172,7 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
   const publicStudent = (row) => {
     const f = faceOf(row), p = palmOf(row);
     return { id: row.id, name: row.name, hasFace: f.descriptors.length > 0, descriptors: [...f.descriptors, ...(f.learned ?? []).map((l) => l.descriptor)], thumbnail: f.thumbnail,
-      hasPalm: p.templates.length > 0, palms: p.templates.map(({ hand, code }) => ({ hand, code })) };
+      hasPalm: p.templates.length > 0, palms: p.templates.map(({ hand, code, v }) => ({ hand, code, v: v ?? 1 })) };
   };
 
   app.get('/api/students', auth, (req, res) => {
@@ -192,14 +192,16 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
 
   // Palm: only the hand and the 512-byte code are kept (no palm image, no hand geometry). Up to 10 templates per hand.
   const PALM_CODE_BYTES = CODE_WORDS * 4, PALM_PER_HAND = 10;
+  // v: template version (public/palm.js PALM_TEMPLATE_VERSION); missing = 1. The kiosk ignores outdated versions.
   const validPalm = (t) => t && (t.hand === 'Left' || t.hand === 'Right') && typeof t.code === 'string'
-    && /^[A-Za-z0-9+/]+={0,2}$/.test(t.code) && Buffer.from(t.code, 'base64').length === PALM_CODE_BYTES;
+    && /^[A-Za-z0-9+/]+={0,2}$/.test(t.code) && Buffer.from(t.code, 'base64').length === PALM_CODE_BYTES
+    && (t.v === undefined || (Number.isInteger(t.v) && t.v >= 1 && t.v <= 99));
   function parsePalm(body) {
     const { palm, consent } = body || {};
     if (consent !== true) return { error: 'Consent is required before storing palm data.' };
     if (!Array.isArray(palm) || palm.length < 1 || !palm.every(validPalm)) return { error: 'Invalid palm data.' };
     for (const hand of ['Left', 'Right']) if (palm.filter((t) => t.hand === hand).length > PALM_PER_HAND) return { error: `At most ${PALM_PER_HAND} palm templates per hand.` };
-    return { templates: palm.map(({ hand, code }) => ({ hand, code })) };
+    return { templates: palm.map(({ hand, code, v }) => ({ hand, code, v: v ?? 1 })) };
   }
 
   // A student is created with face data, palm data, or both (each needs consent).

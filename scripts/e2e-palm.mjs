@@ -83,7 +83,11 @@ try {
   await click(page, '#f-student [name=guardian]');
   const te = Date.now();
   await click(page, '#b-capture-palm');
+  await until(() => page.$eval('#enroll-wrap .guide', (g) => g.classList.contains('palm')), 'hand guide during palm capture', 10000);
+  if (process.env.E2E_SHOTS) await page.screenshot({ path: `${process.env.E2E_SHOTS}/palm-enrol-guide.png` });
+  check(true, 'enrolment shows the hand-shaped guide while capturing a palm');
   await withHint(page, until(async () => /Saved Palm Pat/.test(await text(page, '#enroll-hint')), 'palm saved'));
+  check(await page.$eval('#enroll-wrap .guide', (g) => !g.classList.contains('palm')), 'and goes back to the face oval afterwards');
   console.log(`  enrolled in ${((Date.now() - te) / 1000).toFixed(1)}s (incl. hand model load)`);
   check((await text(page, '#s-list')).includes('palm: right'), 'roster shows the palm tag');
   check((await text(page, '#s-list')).includes('no face data'), 'palm-only student (no face data)');
@@ -92,12 +96,14 @@ try {
   console.log('2. SCAN WITH PALM (liveness off): marked present, method palm');
   await startSession(page, 'Palm Class');
   await setOpt(page, '#opt-live', 'off');
+  await setOpt(page, '#opt-guide', true);
   await setOpt(page, '#opt-method', 'palm');
   await click(page, '#dbg-toggle');
   const ts = Date.now();
   await withHint(page, until(async () => (await present(page)) === '1', 'palm check-in'));
   console.log(`  marked ${((Date.now() - ts) / 1000).toFixed(1)}s after switching to palm (model already loaded by enrolment; incl. camera restart)`);
   check((await text(page, '#result-name')) === 'Palm Pat', 'card shows the name');
+  check(await page.$eval('#guide', (g) => !g.hidden && g.classList.contains('palm') && getComputedStyle(g.querySelector('.hand')).display === 'block'), 'kiosk position guide is a hand outline in palm mode');
   if (process.env.E2E_SHOTS) await page.screenshot({ path: `${process.env.E2E_SHOTS}/palm-scan.png` });
   await until(async () => /checked in/.test(await text(page, '#kiosk-hint')), 'checked-in hint', 5000);
   check(true, 'hint says the student is checked in while the hand stays: "' + (await text(page, '#kiosk-hint')) + '"');

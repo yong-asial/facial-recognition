@@ -17,8 +17,8 @@ const size = (s) => ('videoWidth' in s ? { W: s.videoWidth, H: s.videoHeight } :
 export class PalmService {
   /** @param {{tf?: any, base?: string, mode?: 'VIDEO' | 'IMAGE'}} [opts] tf: the TensorFlow.js instance from face-api (faceapi.tf)
    *  for the GPU filter bank. mode: VIDEO for the camera (tracks between frames), IMAGE for unrelated still photos. */
-  constructor({ tf = null, base = '/vendor/mediapipe', mode = 'VIDEO' } = {}) {
-    this.tf = tf; this.base = base; this.mode = mode; this._ready = null;
+  constructor({ tf = null, base = '/vendor/mediapipe', mode = 'VIDEO', roiShape = undefined } = {}) {
+    this.tf = tf; this.base = base; this.mode = mode; this.roiShape = roiShape; this._ready = null;
     /** @type {any} */ this.landmarker = null;
     this.bank = gaborBank();
     this.roiCanvas = Object.assign(document.createElement('canvas'), { width: ROI_SIZE, height: ROI_SIZE });
@@ -77,7 +77,7 @@ export class PalmService {
     let warp = 0, code = 0;
     for (const h of this.detect(video)) {
       const t0 = now();
-      const roi = palmRoi(h.pts);
+      const roi = palmRoi(h.pts, undefined, this.roiShape);
       const gray = this.warp(video, roi);
       const { brightness, sharpness } = grayStats(gray, ROI_SIZE, ROI_SIZE);
       const t1 = now();

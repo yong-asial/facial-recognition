@@ -69,3 +69,7 @@ button.warn{background:#b45309;border-color:#b45309}
 
 .palm-row{margin-top:8px;align-items:center}.palm-row button{flex:1}.palm-row select{width:auto}
 .tag.palm{color:#16a34a}
+.guide .hand{display:none;width:100%;height:100%;overflow:visible}
+.guide.palm{border:none;border-radius:0;inset:4% 24%;color:#ffffff88}
+.guide.palm .hand{display:block}.guide.palm.flip .hand{transform:scaleX(-1)}
+.guide.palm.ok{color:#4ade80}.guide.palm.warn{color:#fbbf24}.guide.palm.bad{color:#f87171}
