@@ -61,6 +61,11 @@ export function createApp({ dbPath = 'data/app.db', ollama = defaultOllama, thre
   const faceApiDir = path.resolve('node_modules/@vladmandic/face-api');
   app.get('/vendor/face-api.js', (_req, res) => res.sendFile(path.join(faceApiDir, 'dist/face-api.js')));
   app.use('/vendor/models', express.static(path.join(faceApiDir, 'model'), { maxAge: '7d' }));
+  // Palm: MediaPipe Hand Landmarker (JS bundle + WASM from npm, model from `node scripts/fetch-models.mjs`).
+  const mpDir = path.resolve('node_modules/@mediapipe/tasks-vision');
+  app.get('/vendor/mediapipe/vision_bundle.mjs', (_req, res) => res.sendFile(path.join(mpDir, 'vision_bundle.mjs')));
+  app.use('/vendor/mediapipe/wasm', express.static(path.join(mpDir, 'wasm'), { maxAge: '7d' }));
+  app.use('/vendor/mediapipe/models', express.static(path.resolve('models'), { maxAge: '7d' }));
 
   app.get('/api/config', (_req, res) => res.json({ faceThreshold: threshold, ollama: ollamaInfo }));
 

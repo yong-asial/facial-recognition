@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palm Spike</title>
+<style>
+  :root { --bg: #0f1115; --panel: #181b22; --line: #2a2f3a; --text: #e6e8ee; --dim: #9aa3b2; --ok: #3ccf7a; --warn: #f0b429; --bad: #ef5350; --acc: #5b9cff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 12px; padding: 12px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 8px 16px; } }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; align-self: start; }
+  .stage video, .stage canvas { display: block; width: 100%; height: auto; }
+  .stage canvas { position: absolute; inset: 0; height: 100%; }
+  .mirror { transform: scaleX(-1); }
+  .hint { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 14px; background: rgba(0,0,0,.6); font-size: 18px; }
+  .hint.ok { color: var(--ok); } .hint.warn { color: var(--warn); } .hint.bad { color: var(--bad); }
+  aside { display: flex; flex-direction: column; gap: 10px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grid2 { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-variant-numeric: tabular-nums; }
+  .grid2 span:nth-child(odd) { color: var(--dim); }
+  input, select, button { font: inherit; color: var(--text); background: #0f1218; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  input[type=text] { width: 140px; }
+  button { cursor: pointer; } button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .previews canvas { width: 128px; height: 128px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 4px; background: #000; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }
+  th, td { text-align: right; padding: 2px 4px; border-bottom: 1px solid var(--line); } th:first-child, td:first-child { text-align: left; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .dim { color: var(--dim); }
+  #hist { width: 100%; height: 140px; background: #0f1218; border-radius: 4px; }
+  pre { white-space: pre-wrap; margin: 0; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="hint" id="hint">Loading models…</div>
+  </div>
+  <aside>
+    <section>
+      <h2>Live</h2>
+      <div class="row previews">
+        <canvas id="roi" width="128" height="128" title="Palm ROI (what the code is computed on)"></canvas>
+        <canvas id="code" width="128" height="128" title="Competitive Code: colour = winning orientation, dark = masked"></canvas>
+      </div>
+      <div class="grid2" id="live" style="margin-top:8px"></div>
+    </section>
+    <section>
+      <h2>Match (1:N against captured samples)</h2>
+      <div class="row"><label>Threshold <input type="range" id="thr" min="0.20" max="0.50" step="0.005" value="0.38"></label><strong id="thr-val"></strong></div>
+      <div id="match" class="dim">No samples yet.</div>
+    </section>
+    <section>
+      <h2>Capture</h2>
+      <div class="row">
+        <input type="text" id="person" placeholder="Person (e.g. P01)">
+        <input type="text" id="session" placeholder="Session">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <select id="gate"><option value="strict">Strict gate (enrol)</option><option value="lenient">Lenient gate (scan)</option></select>
+        <label><input type="checkbox" id="left"> allow left hand</label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button class="primary" id="b-burst">Capture 10</button>
+        <span class="dim">or press Space for one</span>
+        <span id="cap-state"></span>
+      </div>
+    </section>
+    <section>
+      <h2>Samples</h2>
+      <div id="samples" class="dim">None.</div>
+      <div class="row" style="margin-top:6px">
+        <button id="b-export">Export JSON</button>
+        <label><button id="b-import-btn" type="button">Import JSON</button><input type="file" id="b-import" accept="application/json" hidden></label>
+        <button id="b-clear">Clear all</button>
+      </div>
+    </section>
+    <section>
+      <h2>Report</h2>
+      <div class="row">
+        <label><input type="checkbox" id="cross" checked> genuine = different sessions only</label>
+        <label>geom weight <input type="number" id="gw" value="0" min="0" max="3" step="0.25" style="width:64px"></label>
+        <button class="primary" id="b-report">Run</button>
+      </div>
+      <div id="report" style="margin-top:8px"></div>
+      <canvas id="hist" width="400" height="140" hidden></canvas>
+    </section>
+    <section>
+      <h2>Speed / GPU check</h2>
+      <div class="row">
+        <label><input type="checkbox" id="gpu" checked> GPU filter bank (tf)</label>
+        <button id="b-check">Compare GPU vs JS on this frame</button>
+        <button id="b-flip">Switch camera</button>
+      </div>
+      <pre id="check" class="dim"></pre>
+    </section>
+  </aside>
+</main>
+<script src="/vendor/face-api.js"></script>
+<script type="module" src="palm-spike.js"></script>
+</body>
+</html>

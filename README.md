@@ -7,7 +7,7 @@ The backend (Express + `node:sqlite`) stores students, sessions and attendance.
 ```bash
 npm install
 npm start            # http://localhost:3009
-npm test             # unit + API tests (62)
+npm test             # unit + API tests (80)
 npm run e2e          # real Chrome + fake webcam, needs /tmp/e2e/cam{A,Live,C}.y4m (see below)
 ```
 
@@ -112,6 +112,27 @@ ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/C.jpg -vf "$V" -pix_fmt yuv4
 # camLive.y4m: A.jpg warped back and forth so the head appears to turn (passes the liveness check)
 ffmpeg -loop 1 -framerate 15 -t 20 -i test/fixtures/A.jpg -vf "$V,perspective=x0=0:y0='0.13*H*sin(2*PI*on/12)':x1=W:y1='-0.13*H*sin(2*PI*on/12)':x2=0:y2='H-0.13*H*sin(2*PI*on/12)':x3=W:y3='H+0.13*H*sin(2*PI*on/12)':eval=frame:sense=destination" -pix_fmt yuv420p /tmp/e2e/camLive.y4m
 ```
+
+## Palm scanning (feasibility spike, not in the kiosk yet)
+Goal: check-in by showing an open palm to the same camera, faster than face (target < 1 s from palm in view to "Present").
+The kiosk integration waits on the go/no-go below, because contactless palmprint on a webcam/iPad camera is far less accurate than published numbers (lab lighting, contact scanners).
+
+```bash
+npm run models       # once: downloads MediaPipe hand_landmarker.task (~7.5 MB) into ./models (gitignored)
+npm start            # then open http://localhost:3009/palm-spike.html (no login)
+npm run palm:report -- palm-samples.json [--reencode | --sweep] [--same-session] [--threshold 0.38] [--geom 0.5]
+```
+
+| Step | Where | Notes |
+|---|---|---|
+| Detect + 21 landmarks + handedness | `palm-service.js`, MediaPipe Hand Landmarker (GPU, VIDEO mode) | ~11 ms/frame on a MacBook. It tracks between frames itself, so no cheap pre-check pass is needed. Handedness is used as reported (measured: correct for raw, un-mirrored frames) |
+| Palm ROI | `palmRoi` | 128 px square below the knuckle line (index MCP 5 to pinky MCP 17), rotated upright, never mirrored. ~3 ms canvas warp |
+| Quality gate | `palmQuality` | palm (not the back of the hand) facing, fingers open, flat to the camera, size, light, blur. Lenient `SCAN_PALM`, strict `ENROLL_PALM` |
+| Texture code | `encodeCompCode` | Competitive Code: 6 oriented Gabor filters, winning orientation per point on a 32×32 grid (3 bits) + a mask for low-contrast points. One `tf.conv2d` on face-api's TensorFlow.js: **1.2 ms GPU** (4.6 ms in plain JS, identical code) |
+| Match | `PalmMatcher` | shift-tolerant (±2 cells) Hamming distance, same accept rules as faces (threshold, gap, ratio, mean of 2 nearest); same-hand templates only. Optional hand-geometry term (`geomWeight`, off until data shows it helps) |
+
+**Protocol:** 8–10 people. Right hand by default ("allow left hand" for both). Per person: *Capture 10* with the strict gate on day 1, then again on another day (different session label) with the lenient gate, under the classroom lighting. Export JSON after each sitting (samples live only in this browser's localStorage).
+**Go/no-go** (report with "genuine = different sessions only"): kiosk replay has **0 WRONG person**, and ≥ 95% right once 2–3 frames are fused (the single-frame replay is the pessimistic case). If not, try `--sweep`; if no Gabor setting gets there, the next step is a trained palm model (CCNet-style, ONNX Runtime Web) behind the same matcher. Check dataset licences: Tongji, IITD and MPD are mostly research-only.
 
 ## Porting into the Expo app later
 Keep `matching.js` and `attendance-service.js` as-is (pure TypeScript-able logic; they already carry JSDoc types and `// @ts-check`). Replace `face-service.js` with react-native-vision-camera + a face detector + a TFLite embedding model (MobileFaceNet; switch `MatchingService` to `metric: 'cosine'` and retune the threshold), swap `localStorage` for expo-sqlite in `AttendanceService`, and the encryption key for expo-secure-store. The API contract in [app.js](app.js) (`/api/students`, `/api/sessions/...`) stays the same.

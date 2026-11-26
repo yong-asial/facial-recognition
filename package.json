@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test --test-concurrency=1 test/auth.test.js test/face-flow.test.js test/face-match.test.js test/attendance.test.js test/matching.test.js test/attendance-service.test.js test/learned-face.test.js",
-    "typecheck": "tsc --noEmit --allowJs --checkJs --strict --target es2022 --module esnext --moduleResolution bundler --lib es2022,dom public/matching.js public/attendance-service.js",
+    "models": "node scripts/fetch-models.mjs",
+    "palm:report": "node scripts/palm-report.mjs",
+    "test": "node --test --test-concurrency=1 test/auth.test.js test/face-flow.test.js test/face-match.test.js test/attendance.test.js test/matching.test.js test/attendance-service.test.js test/learned-face.test.js test/palm.test.js",
+    "typecheck": "tsc --noEmit --allowJs --checkJs --strict --target es2022 --module esnext --moduleResolution bundler --lib es2022,dom public/matching.js public/attendance-service.js public/palm.js",
     "android": "scripts/android-emulator.sh",
     "test:ollama": "node --test test/ollama.integration.test.js",
     "e2e": "node scripts/e2e-scan.mjs /tmp/e2e/camA.y4m /tmp/e2e/camLive.y4m /tmp/e2e/camC.y4m"
@@ -15,6 +17,7 @@
     "node": ">=22.5"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.21",
     "@vladmandic/face-api": "^1.7.15",
     "express": "^4.21.2"
   },
